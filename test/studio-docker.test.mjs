@@ -134,7 +134,7 @@ function makeFakeWebServer() {
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     if (req.url === '/') {
-      return res.end(JSON.stringify({ version: '4.28.0-magpie.1', capabilities: { account_proxy_binding: true } }));
+      return res.end(JSON.stringify({ version: '4.30.0-magpie.1', capabilities: { account_proxy_binding: true } }));
     }
     if (req.url === '/v1/models') {
       return res.end(JSON.stringify({ data: [] }));

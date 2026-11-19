@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import http from 'node:http';
 import path from 'node:path';
-import { installBackend, startBackend, statusBackend, stopBackend, cleanBackend } from '../lib/native.mjs';
+import { installBackend, installLocalBackend, startBackend, statusBackend, stopBackend, cleanBackend } from '../lib/native.mjs';
 
 const command = process.argv[2];
 const args = process.argv.slice(3);
@@ -23,6 +23,10 @@ async function main() {
     case 'install-upstream':
       await installBackend({ ...options, channel: 'upstream' });
       break;
+    case 'install-local':
+      if (!options.dataDir) throw new Error('install-local requires --data-dir=<path>');
+      await installLocalBackend(options);
+      break;
     case 'start':
       startBackend(options);
       break;
@@ -43,7 +47,7 @@ async function main() {
       break;
     }
     default:
-      console.error('Usage: node scripts/backend.mjs <install|install-upstream|start|status|stop|clean> [--data-dir=<path>]');
+      console.error('Usage: node scripts/backend.mjs <install|install-upstream|install-local|start|status|stop|clean> [--data-dir=<path>]');
       process.exit(1);
   }
 }

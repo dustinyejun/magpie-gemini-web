@@ -1083,3 +1083,71 @@ describe('23. Plugin metadata for Magpie', () => {
     assert.equal(studio.auth.maxConcurrency, 1);
   });
 });
+
+describe('24. Plugin entry lists Carbon and Argon tiers offline', () => {
+  let server;
+  let serverPort;
+  let seen;
+
+  before(async () => {
+    seen = [];
+    const ids = [
+      'gemini-4-carbon', 'gemini-4-carbon-thinking-medium', 'gemini-4-carbon-thinking',
+      'gemini-4-argon', 'gemini-4-argon-thinking-medium', 'gemini-4-argon-thinking',
+      'gemini-3.5-flash-lite'
+    ];
+    server = http.createServer(async (req, res) => {
+      if (req.url === '/v1/models') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', data: ids.map(id => ({ id, object: 'model' })) }));
+        return;
+      }
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      seen.push(JSON.parse(raw).model);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'chatcmpl-offline' }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', () => {
+      serverPort = server.address().port;
+      resolve();
+    }));
+  });
+
+  after(async () => {
+    await new Promise(resolve => server.close(resolve));
+  });
+
+  it('exposes low/medium/high for both families and rewrites high without leaving the family', async () => {
+    const baseURL = `http://127.0.0.1:${serverPort}/v1`;
+    const auth = { type: 'api', key: 'offline-carbon-key', metadata: { baseURL } };
+    const plugin = await GeminiWebPlugin({}, { baseURL });
+    const models = await plugin.provider.models({}, { auth });
+    assert.deepEqual(models['gemini-4-carbon'].variants, { low: {}, medium: {}, high: {} });
+    assert.deepEqual(models['gemini-4-argon'].variants, { low: {}, medium: {}, high: {} });
+    assert.deepEqual(models['gemini-3.5-flash-lite'].variants, {});
+    assert.equal(models['gemini-4-carbon-thinking'], undefined);
+    assert.equal(models['gemini-4-argon-thinking'], undefined);
+
+    const loaded = await plugin.auth.loader(async () => auth);
+    const send = body => loaded.fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], ...body })
+    });
+    for (const body of [
+      { model: 'gemini-4-carbon', reasoning_effort: 'high' },
+      { model: 'gemini-4-carbon', reasoning_effort: 'medium' },
+      { model: 'gemini-4-argon', reasoning_effort: 'high' },
+      { model: 'gemini-3.5-flash-lite', reasoning_effort: 'high' }
+    ]) {
+      assert.equal((await send(body)).status, 200);
+    }
+    assert.deepEqual(seen, [
+      'gemini-4-carbon-thinking',
+      'gemini-4-carbon-thinking-medium',
+      'gemini-4-argon-thinking',
+      'gemini-3.5-flash-lite'
+    ]);
+  });
+});

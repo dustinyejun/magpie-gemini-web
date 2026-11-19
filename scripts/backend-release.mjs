@@ -42,6 +42,27 @@ const go = (argv, extraEnv = {}) => execFileSync('go', argv, { cwd: source, env:
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const patchPath = path.join(root, 'patches/argon.patch');
 const flags = ['-trimpath', '-buildvcs=false', '-ldflags=-s -w'];
+const rejectedFragment = name => name.endsWith('.rej') || name.endsWith('.orig');
+const assertPatchTextClean = () => {
+  const patchText = fs.readFileSync(patchPath, 'utf8');
+  for (const match of patchText.matchAll(/^diff --git a\/(\S+) b\/(\S+)/gm)) {
+    for (const file of [match[1], match[2]]) {
+      if (rejectedFragment(file)) throw new Error(`Patch contains rejected fragment: ${file}`);
+    }
+  }
+};
+const assertTreeClean = dir => {
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (entry.name === '.git') continue;
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) stack.push(full);
+      else if (rejectedFragment(entry.name)) throw new Error(`Refusing rejected patch fragment: ${path.relative(dir, full)}`);
+    }
+  }
+};
 
 try {
   let upstream = path.join(root, 'backend-source');
@@ -57,8 +78,10 @@ try {
   // Relative archive paths also work with Git for Windows' tar, which otherwise
   // treats the drive letter in C:\\... as a remote archive host.
   execFileSync('tar', ['-xf', 'upstream.tar', '-C', 'source'], { cwd: scratch });
-  execFileSync('git', ['apply', '--check', patchPath], { cwd: source, stdio: 'inherit' });
-  execFileSync('git', ['apply', patchPath], { cwd: source, stdio: 'inherit' });
+  assertPatchTextClean();
+  execFileSync('git', ['apply', '--check', '--whitespace=error', patchPath], { cwd: source, stdio: 'inherit' });
+  execFileSync('git', ['apply', '--whitespace=error', patchPath], { cwd: source, stdio: 'inherit' });
+  assertTreeClean(source);
   const versionPath = path.join(source, 'internal/app/server.go');
   const server = fs.readFileSync(versionPath, 'utf8');
   const versionLine = /^const Version = "[^"]+"$/m;
@@ -95,6 +118,10 @@ try {
       execFileSync('tar', ['-czf', '-', '.'], { cwd: source, stdio: ['ignore', sourceArchive, 'inherit'] });
     } finally {
       fs.closeSync(sourceArchive);
+    }
+    const packed = execFileSync('tar', ['-tzf', path.join(output, sourceName)], { encoding: 'utf8' });
+    for (const name of packed.split('\n')) {
+      if (rejectedFragment(name)) throw new Error(`Source archive contains rejected fragment: ${name}`);
     }
     fs.copyFileSync(path.join(root, 'LICENSE-UPSTREAM'), path.join(output, 'LICENSE-UPSTREAM'));
     const build = { version: release.version, upstream: release.upstream, goVersion: release.goVersion,

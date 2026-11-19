@@ -7,7 +7,8 @@ import {
   RULES,
   stripCommentsAndStrings,
   extractModuleSpecifiers,
-  checkGuardrails
+  checkGuardrails,
+  patchRejectViolations
 } from '../scripts/check-guardrails.mjs';
 
 function makeTempRepo(t) {
@@ -44,6 +45,20 @@ describe('Static guardrails', () => {
     assert.deepEqual(result.rules, RULES);
     assert.equal(result.ok, true, JSON.stringify(result.violations, null, 2));
     assert.deepEqual(result.violations, []);
+  });
+
+  it('rejects a patch that still records a .rej file', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'magpie-patch-rej-'));
+    fs.mkdirSync(path.join(root, 'patches'));
+    fs.writeFileSync(path.join(root, 'patches', 'argon.patch'), 'diff --git a/internal/app/gemini.go.rej b/internal/app/gemini.go.rej\n');
+    try {
+      const violations = patchRejectViolations(root);
+      assert.equal(violations.length, 1);
+      assert.equal(violations[0].rule, 'no-patch-reject-files');
+      assert.match(violations[0].message, /gemini\.go\.rej/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('strips comments, strings, and regexes while preserving division, template expressions, and line numbers', () => {

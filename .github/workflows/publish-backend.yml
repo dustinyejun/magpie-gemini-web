@@ -26,6 +26,7 @@ jobs:
         with:
           node-version: '22'
       - name: Verify source run and private release
+        id: verify_draft
         env:
           GH_TOKEN: ${{ github.token }}
           VERIFICATION_RUN: ${{ inputs.verification_run }}
@@ -45,10 +46,13 @@ jobs:
           assert.equal(run.event, 'workflow_dispatch');
           assert.equal(run.path, '.github/workflows/backend.yml');
           const release = JSON.parse(fs.readFileSync('lib/backend-release.json', 'utf8'));
+          assert.equal(release.repository, repo, 'Only this repository may publish the pinned release');
           // The tag endpoint excludes drafts for GitHub App tokens; gh also
           // searches the releases list, which includes writable private drafts.
-          const draft = JSON.parse(execFileSync('gh', ['release', 'view', release.tag, '--repo', repo, '--json', 'isDraft,targetCommitish'], { encoding: 'utf8' }));
+          const draft = JSON.parse(execFileSync('gh', ['release', 'view', release.tag, '--repo', repo, '--json', 'id,isDraft,targetCommitish'], { encoding: 'utf8' }));
           assert.equal(draft.isDraft, true, 'Only a private draft can receive these assets');
+          assert.match(draft.id, /^\S+$/, 'The verified draft must have a release ID');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'release_id=' + draft.id + '\n');
           const expectedSha = /^[0-9a-f]{40}$/.test(draft.targetCommitish) ? draft.targetCommitish : process.env.GITHUB_SHA;
           assert.equal(run.head_sha, expectedSha, 'Verify the exact release commit');
           execFileSync('git', ['checkout', '--detach', expectedSha], { stdio: 'inherit' });
@@ -57,6 +61,7 @@ jobs:
           JS
       - name: Check pinned hashes and upload missing release assets
         env:
+          BACKEND_DRAFT_ID: ${{ steps.verify_draft.outputs.release_id }}
           GH_TOKEN: ${{ github.token }}
         run: |
           node --input-type=module <<'JS'
@@ -69,6 +74,7 @@ jobs:
           const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
           const release = JSON.parse(fs.readFileSync('lib/backend-release.json', 'utf8'));
           const repo = process.env.GITHUB_REPOSITORY;
+          assert.equal(release.repository, repo, 'Only this repository may upload the pinned release');
           const groups = fs.readdirSync('verified-artifacts');
           const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'backend-release-upload-'));
           const binaries = {};
@@ -91,8 +97,12 @@ jobs:
           execFileSync('git', ['-C', upstream, 'archive', '--format=tar', `--output=${archive}`, release.upstream.commit]);
           execFileSync('tar', ['-xf', 'upstream.tar', '-C', 'source'], { cwd: scratch });
           const patchPath = path.resolve('patches/argon.patch');
-          execFileSync('git', ['apply', '--check', patchPath], { cwd: source, stdio: 'inherit' });
-          execFileSync('git', ['apply', patchPath], { cwd: source, stdio: 'inherit' });
+          const patchText = fs.readFileSync(patchPath, 'utf8');
+          for (const match of patchText.matchAll(/^diff --git a\/(\S+) b\/(\S+)/gm)) {
+            for (const file of [match[1], match[2]]) assert.equal(file.endsWith('.rej') || file.endsWith('.orig'), false, file);
+          }
+          execFileSync('git', ['apply', '--check', '--whitespace=error', patchPath], { cwd: source, stdio: 'inherit' });
+          execFileSync('git', ['apply', '--whitespace=error', patchPath], { cwd: source, stdio: 'inherit' });
           const versionPath = path.join(source, 'internal/app/server.go');
           const server = fs.readFileSync(versionPath, 'utf8');
           const versionLine = /^const Version = "[^"]+"$/m;
@@ -105,6 +115,10 @@ jobs:
           } finally {
             fs.closeSync(sourceArchive);
           }
+          const packed = execFileSync('tar', ['-tzf', path.join(outDir, sourceName)], { encoding: 'utf8' });
+          for (const name of packed.split('\n')) {
+            assert.equal(name.endsWith('.rej') || name.endsWith('.orig'), false, `source archive contains ${name}`);
+          }
           fs.copyFileSync('LICENSE-UPSTREAM', path.join(outDir, 'LICENSE-UPSTREAM'));
           const flags = ['-trimpath', '-buildvcs=false', '-ldflags=-s -w'];
           const build = { version: release.version, upstream: release.upstream, goVersion: release.goVersion,
@@ -112,25 +126,9 @@ jobs:
             versionOverride: release.version, cgoEnabled: false, flags, binaries };
           fs.writeFileSync(path.join(outDir, 'build.json'), `${JSON.stringify(build, null, 2)}\n`);
           const assetNames = [...Object.values(binaries).map(b => b.asset), sourceName, 'LICENSE-UPSTREAM', 'build.json'].sort();
-          fs.writeFileSync(path.join(outDir, 'SHA256SUMS.txt'), assetNames.map(name => `${hash(fs.readFileSync(path.join(outDir, name)))}  ${name}\n`).join(''));
-          const files = [...assetNames, 'SHA256SUMS.txt'].map(name => path.join(outDir, name));
-          // Validate every file before uploading any. Never replace published assets.
-          for (const file of files) {
-            const draft = JSON.parse(execFileSync('gh', ['release', 'view', release.tag, '--repo', repo, '--json', 'isDraft,assets'], { encoding: 'utf8' }));
-            assert.equal(draft.isDraft, true);
-            const existing = draft.assets.find(asset => asset.name === path.basename(file));
-            if (existing) {
-              assert.equal(existing.state, 'uploaded');
-              if (path.basename(file) !== sourceName && path.basename(file) !== 'SHA256SUMS.txt') {
-                const dir = fs.mkdtempSync('existing-');
-                try {
-                  execFileSync('gh', ['release', 'download', release.tag, '--repo', repo, '--pattern', existing.name, '--dir', dir]);
-                  assert.ok(fs.readFileSync(path.join(dir, existing.name)).equals(fs.readFileSync(file)), `Existing asset differs: ${existing.name}`);
-                } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-              }
-              continue;
-            }
-            execFileSync('gh', ['release', 'upload', release.tag, file, '--repo', repo], { stdio: 'inherit' });
-          }
-          console.log(`All ${files.length} release assets uploaded to private draft ${release.tag}`);
+          const { publishDraftAssets } = await import('./scripts/backend-draft.mjs');
+          const { uploaded } = publishDraftAssets({
+            outDir, assetNames, sourceName, repo, tag: release.tag, expectedDraftId: process.env.BACKEND_DRAFT_ID ?? ''
+          });
+          console.log(`Draft ${release.tag} now carries ${uploaded.length} newly uploaded assets; existing assets were verified, never replaced`);
           JS

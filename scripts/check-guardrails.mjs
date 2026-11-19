@@ -20,7 +20,8 @@ export const RULES = [
   'no-external-or-bare-imports',
   'closed-package-files-graph',
   'unix-shebang-lf',
-  'agents-doc-links-valid'
+  'agents-doc-links-valid',
+  'no-patch-reject-files'
 ];
 
 const REGEX_BEFORE_KEYWORDS = new Set([
@@ -613,6 +614,30 @@ function extractNodeScriptTargets(cmd) {
   return targets;
 }
 
+// patchRejectViolations flags a patch that still carries a failed apply's .rej or .orig file.
+export function patchRejectViolations(root) {
+  const dir = path.join(root, 'patches');
+  if (!fs.existsSync(dir)) return [];
+  const violations = [];
+  for (const name of fs.readdirSync(dir).sort()) {
+    if (!name.endsWith('.patch')) continue;
+    const rel = `patches/${name}`;
+    const content = fs.readFileSync(path.join(dir, name), 'utf8');
+    for (const match of content.matchAll(/^diff --git a\/(\S+) b\/(\S+)/gm)) {
+      const rejected = [match[1], match[2]].filter(file => file.endsWith('.rej') || file.endsWith('.orig'));
+      if (rejected.length === 0) continue;
+      violations.push({
+        rule: 'no-patch-reject-files',
+        file: rel,
+        line: lineNumberAt(content, match.index),
+        message: `Patch records rejected fragment "${rejected.join(' ')}".`,
+        fix: 'Delete .rej and .orig files from the patched tree and regenerate the patch.'
+      });
+    }
+  }
+  return violations;
+}
+
 export function checkGuardrails({ rootDir = REPO_ROOT } = {}) {
   const root = path.resolve(rootDir);
   const violations = [];
@@ -816,6 +841,8 @@ export function checkGuardrails({ rootDir = REPO_ROOT } = {}) {
       }
     }
   }
+
+  violations.push(...patchRejectViolations(root));
 
   return {
     ok: violations.length === 0,

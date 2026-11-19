@@ -65,8 +65,32 @@ try {
   const modelsResponse = await fetch(`${setup.baseURL}/models`, { headers: { Authorization: `Bearer ${setup.apiKey}` } });
   assert.equal(modelsResponse.status, 200);
   const models = await modelsResponse.json();
-  assert.ok(models.data.length > 0);
-  assert.ok(models.data.every(model => model.id.startsWith('gemini-')));
+  const modelIds = models.data.map(model => model.id);
+  assert.ok(modelIds.length > 0);
+  assert.ok(modelIds.every(id => id.startsWith('gemini-')));
+  // Anonymous discovery: the Flash routes stay, retired 3.1 Pro is gone, and the
+  // login-only Hydrogen/Carbon/Argon routes are hidden rather than offered as aliases
+  // that would be silently downgraded.
+  assert.ok(modelIds.includes('gemini-3.6-flash'));
+  assert.ok(modelIds.includes('gemini-3.5-flash-lite'));
+  assert.equal(modelIds.includes('gemini-3.1-pro'), false);
+  assert.equal(modelIds.includes('gemini-3.1-pro-thinking'), false);
+  for (const hidden of ['gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon']) {
+    assert.equal(modelIds.includes(hidden), false, `${hidden} must not be listed without a cookie`);
+  }
+  const chat = model => fetch(`${setup.baseURL}/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${setup.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] })
+  });
+  const retired = await chat('gemini-3.1-pro');
+  assert.equal(retired.status, 400);
+  assert.match((await retired.json()).error.message, /retired/);
+  for (const loginOnly of ['gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon']) {
+    const refused = await chat(loginOnly);
+    assert.equal(refused.status, 400);
+    assert.match((await refused.json()).error.message, /unavailable without a Google account cookie/);
+  }
   const secrets = fs.readFileSync(path.join(dir, 'secrets.json'));
   await installBackend({ dataDir: dir, fetchFn: async () => { throw new Error('Verified binary must be reused'); } });
   assert.deepEqual(fs.readFileSync(path.join(dir, 'secrets.json')), secrets);
@@ -99,7 +123,8 @@ try {
   }
   console.log(JSON.stringify({ platform: process.platform, arch: process.arch, version: health.version,
     sha256: pin.sha256, source: download ? 'GitHub release' : 'local release artifact',
-    install: 'passed', startup: 'passed', auth: 'passed', proxyBind: 'passed', models: models.data.length, reuse: 'passed' }));
+    install: 'passed', startup: 'passed', auth: 'passed', proxyBind: 'passed', models: modelIds.length,
+    compatibility: 'passed', reuse: 'passed' }));
 } catch (error) {
   console.error(log);
   throw error;

@@ -44,7 +44,7 @@ function makeReleaseFixture({
   });
   const backendReleaseJson = JSON.stringify({
     repository: 'BUKOWSKIREAL/magpie-gemini-web',
-    tag: 'backend-v4.28.0-magpie.1',
+    tag: 'backend-v4.30.0-magpie.1',
     binaries: {
       'darwin-arm64': { asset: 'gemini-web2api-go_darwin_arm64', sha256: 'a'.repeat(64) },
       'linux-x64': { asset: 'gemini-web2api-go_linux_amd64', sha256: 'b'.repeat(64) }
