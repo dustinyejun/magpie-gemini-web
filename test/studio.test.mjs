@@ -981,10 +981,10 @@ describe('AI Studio Plugin & Models Unit Tests', () => {
 
   // standInSetup makes the data dir hold a managed setup whose service is the mock server, so a
   // managed sign-in finds it up and nothing is downloaded or started. It returns a cleanup.
-  function standInSetup(apiKey) {
+  function standInSetup(apiKey, { autoUpdate } = {}) {
     const configPath = path.join(tempStudioDataDir, 'config.json');
     fs.writeFileSync(configPath, JSON.stringify({
-      version: 1, port: serverPort, apiKey, adminUsername: 'magpie', adminPassword: 'stand-in-pw', proxy: ''
+      version: 1, port: serverPort, apiKey, adminUsername: 'magpie', adminPassword: 'stand-in-pw', proxy: '', autoUpdate
     }) + '\n', { mode: 0o600 });
     const bin = path.join(tempStudioDataDir, 'package', process.platform === 'win32' ? 'aistudio2api.exe' : 'aistudio2api');
     fs.mkdirSync(path.dirname(bin), { recursive: true, mode: 0o700 });
@@ -1055,6 +1055,49 @@ describe('AI Studio Plugin & Models Unit Tests', () => {
       assert.equal(extLoader.baseURL, serverURL);
       assert.equal(extLoader.apiKey, 'ext-key');
     } finally {
+      setup.remove();
+    }
+  });
+
+  it('retries a managed AI Studio Request with the full original body', async () => {
+    const setup = standInSetup('managed-key', { autoUpdate: false });
+    const target = `${serverURL}/chat/completions`;
+    const raw = '{ "model":"gemini-4-argon", "messages":[], "ext":9007199254740993 }\n';
+    const fetch = globalThis.fetch;
+    try {
+      const plugin = await AIStudioPlugin({}, { studio: { baseURL: serverURL } });
+      const loader = await plugin.auth.loader(async () => ({
+        type: 'api', key: 'managed-key', metadata: { mode: 'studio', managed: true, baseURL: serverURL }
+      }));
+      for (const inheritedMethod of [false, true]) {
+        const accept = inheritedMethod ? 'application/vnd.retry-fixture+json' : 'application/json';
+        const request = inheritedMethod
+          ? new Request(target)
+          : new Request(target, { method: 'POST', body: raw });
+        const init = inheritedMethod
+          ? Object.assign(Object.create({ method: 'POST', headers: { Accept: accept } }), { body: raw })
+          : undefined;
+        const hit = serverRequests.length;
+        const attempts = [];
+        globalThis.fetch = (url, init) => {
+          if (url === target) {
+            attempts.push([init.method, init.headers.get('accept'), init.body]);
+            if (attempts.length === 1) return Promise.reject(new TypeError('fixture connection refused'));
+          }
+          return fetch(url, init);
+        };
+
+        const response = await loader.fetch(request, init);
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).id, 'chatcmpl_test');
+        assert.equal(request.bodyUsed, !inheritedMethod);
+        assert.deepEqual(attempts, [['POST', accept, raw], ['POST', accept, raw]]);
+        const seen = serverRequests.slice(hit);
+        assert.ok(seen.some(r => r.url === '/api/status'));
+        assert.deepEqual(seen.filter(r => r.url === '/v1/chat/completions').map(r => r.body), [raw]);
+      }
+    } finally {
+      globalThis.fetch = fetch;
       setup.remove();
     }
   });

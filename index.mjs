@@ -61,12 +61,19 @@ function managedBackend(baseURL, key) {
 // forwardManaged is forward(), but when the backend this plugin manages can't be reached it
 // starts the backend and tries once more.
 async function forwardManaged(input, init, getAuth, opts) {
-  const retryInput = input instanceof Request ? input.clone() : input;
-  const res = await forward(input, init, getAuth, opts);
+  const callerSignal = init?.signal === undefined && input instanceof Request
+    ? input.signal
+    : init?.signal;
+  // Resolve auth fresh for every call and keep it scoped to that call's retry.
+  let auth;
+  const requestAuth = () => auth ??= Promise.resolve().then(getAuth);
+  let retryRequest;
+  const res = await forward(input, init, requestAuth, opts, create => { retryRequest = create; });
   if (res.headers.get(UNREACHABLE_HEADER) !== 'unreachable') return res;
+  callerSignal?.throwIfAborted();
   let c;
   try {
-    c = credentials(await getAuth(), opts);
+    c = credentials(await requestAuth(), opts);
   } catch {
     return res;
   }
@@ -76,7 +83,8 @@ async function forwardManaged(input, init, getAuth, opts) {
   } catch {
     return res;
   }
-  return forward(retryInput, init, getAuth, opts);
+  callerSignal?.throwIfAborted();
+  return forward(retryRequest(), undefined, requestAuth, opts);
 }
 
 export const GeminiWebPlugin = async (_input, options = {}) => {
@@ -111,6 +119,19 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
     validate: value => {
       try {
         parseAuthuser(value);
+      } catch (e) {
+        return e.message;
+      }
+    }
+  };
+  const existingBackendPrompt = {
+    type: 'text',
+    key: 'baseURL',
+    message: 'Backend OpenAI base URL (blank: plugin default)',
+    placeholder: opts.baseURL,
+    validate: value => {
+      try {
+        normalizeBaseURL(value || opts.baseURL);
       } catch (e) {
         return e.message;
       }
@@ -185,19 +206,11 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
         type: 'api',
         label: '连接已有后端（自定义地址 + API key）',
         placeholder: 'Backend API key (not a Google cookie)',
-        prompts: [{
-          type: 'text',
-          key: 'baseURL',
-          message: 'Backend OpenAI base URL (blank: plugin default)',
-          placeholder: opts.baseURL,
-          validate: value => {
-            try {
-              normalizeBaseURL(value || opts.baseURL);
-            } catch (e) {
-              return e.message;
-            }
-          }
-        }],
+        // Magpie treats static prompts with authorize as collecting the key themselves.
+        // Ask for the URL dynamically so Magpie still shows its separate key prompt.
+        ...(_input?.magpie ? {
+          ask: inputs => inputs && 'baseURL' in inputs ? null : existingBackendPrompt
+        } : { prompts: [existingBackendPrompt] }),
         // Magpie stores raw prompt inputs as metadata unless authorize returns its own;
         // write the resolved URL so a blank answer doesn't persist as baseURL: "".
         authorize: async inputs => ({

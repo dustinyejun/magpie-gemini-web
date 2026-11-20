@@ -5,10 +5,13 @@ import zlib from 'node:zlib';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { runInNewContext } from 'node:vm';
 import { GeminiWebPlugin, AIStudioPlugin } from '../index.mjs';
+import { binaryPath } from '../lib/native.mjs';
 import {
   DEFAULT_BASE,
   PLUGIN_ICON,
+  UNREACHABLE_HEADER,
   normalizeBaseURL,
   settings,
   credentials,
@@ -193,6 +196,20 @@ describe('7. API prompt default validation', () => {
       type: 'success',
       metadata: { baseURL: 'https://proxy.example.com/v1' }
     });
+  });
+
+  it('lets Magpie collect the backend API key after asking for the URL', async () => {
+    const plugin = await GeminiWebPlugin({ magpie: {} }, { baseURL: 'http://127.0.0.1:9000' });
+    const method = plugin.auth.methods.find(m => m.type === 'api');
+
+    assert.equal(method.prompts, undefined);
+    assert.equal((await method.ask({})).key, 'baseURL');
+    assert.equal(await method.ask({ baseURL: '' }), null);
+    assert.deepEqual(await method.authorize({ baseURL: '' }), {
+      type: 'success',
+      metadata: { baseURL: 'http://127.0.0.1:9000/v1' }
+    });
+    await assert.rejects(method.authorize({ baseURL: 'ftp://invalid' }), /protocol must be HTTP or HTTPS/);
   });
 });
 
@@ -1150,4 +1167,712 @@ describe('24. Plugin entry lists Carbon and Argon tiers offline', () => {
       'gemini-3.5-flash-lite'
     ]);
   });
+});
+
+describe('25. Gemini Web native protocol through the auth loader', () => {
+  const model = 'gemini-4-carbon';
+  const medium = `${model}-thinking-medium`;
+  const high = `${model}-thinking`;
+  const text = { contents: [{ role: 'user', parts: [{ text: 'ping' }] }] };
+  const nativeJSON = '{ "candidates": [{"content":{"parts":[{"text":"native [cite: 1]"}]}}], "usageMetadata":{"totalTokenCount":5} }\n';
+  const firstFrame = `data: ${nativeJSON.trim()}\r\n\r\n`;
+  const lastFrame = 'data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"totalTokenCount":8}}\r\n\r\n';
+  const chatJSON = '{"choices":[{"message":{"content":"chat [cite: 1]"}}],"usage":{"total_tokens":5}}';
+  const errorJSON = '{ "error": {"code": 400, "message": "native error", "details": [{"reason":"API_KEY_INVALID"}]} }\n';
+  let server, origin, baseURL, plugin, seen, releaseStream;
+  const catalogReplies = new Map();
+  const authFor = (key = 'native-test-a') => ({ type: 'api', key, metadata: { baseURL } });
+  const url = (action = 'streamGenerateContent', id = model, version = 'v1') =>
+    `${origin}/edge/${version}/models/${id}:${action}`;
+  const post = (loader, target, body = text, init = {}) => loader.fetch(target, {
+    method: 'POST',
+    ...init,
+    headers: { 'content-type': 'application/json', ...init.headers },
+    body: typeof body === 'string' ? body : JSON.stringify(body)
+  });
+
+  before(async () => {
+    seen = [];
+    server = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const raw = Buffer.concat(chunks).toString();
+      const body = raw ? JSON.parse(raw) : null;
+      seen.push({ url: req.url, headers: req.headers, raw });
+      if (req.url === '/edge/v1/models' || req.url === '/v1/models') {
+        const reply = catalogReplies.get(req.headers.authorization);
+        if (reply) return reply(res);
+        const ids = req.headers.authorization === 'Bearer native-test-b'
+          ? [model, 'gemini-account-b']
+          : [model, medium, high, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-image', 'not-gemini'];
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ data: ids.map(id => ({ id })) }));
+      } else if (req.url === '/edge/v1/chat/completions' || req.url === '/v1/chat/completions') {
+        res.setHeader('content-type', 'application/json');
+        res.end(chatJSON);
+      } else if (req.url.endsWith(':countTokens')) {
+        res.setHeader('content-type', 'application/json');
+        res.end('{"totalTokens":5}\n');
+      } else if (req.url.startsWith('/v1/models/') && req.url.endsWith(':generateContent')) {
+        const prompt = body.contents[0].parts[0].text;
+        if (prompt === 'recover') {
+          res.setHeader('content-type', 'application/json');
+          res.end(nativeJSON);
+          return;
+        }
+        const status = Number(prompt);
+        const headers = { 'content-type': 'application/json', [UNREACHABLE_HEADER]: 'unreachable' };
+        if (status === 429) headers['retry-after'] = '37';
+        if (status === 401) headers['x-magpie-sign-in'] = 'kept';
+        res.writeHead(status, headers);
+        res.end(errorJSON);
+      } else if (body?.contents?.[0]?.parts?.[0]?.text === 'upstream error') {
+        res.writeHead(400, { 'content-type': 'application/json', 'retry-after': '7', 'x-magpie-sign-in': 'kept' });
+        res.end(errorJSON);
+      } else if (body?.contents?.[0]?.parts?.[0]?.text === 'redirect') {
+        res.writeHead(307, { location: '/different-service' });
+        res.end();
+      } else if (req.url.endsWith('?alt=sse')) {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'x-accel-buffering': 'no' });
+        res.write(firstFrame);
+        if (body?.contents?.[0]?.parts?.[0]?.text === 'hold') {
+          await new Promise(resolve => {
+            releaseStream = resolve;
+            res.once('close', resolve);
+          });
+        }
+        res.end(lastFrame);
+      } else if (req.url.endsWith(':streamGenerateContent')) {
+        res.setHeader('content-type', 'application/json');
+        res.end(`[${nativeJSON.trim()}]\n`);
+      } else {
+        res.setHeader('content-type', 'application/json');
+        res.end(nativeJSON);
+      }
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${server.address().port}`;
+    baseURL = `${origin}/edge/v1`;
+    plugin = await GeminiWebPlugin({});
+  });
+
+  after(async () => {
+    releaseStream?.();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+
+  it('advertises Gemini and Chat on the same text model with its existing capabilities and tiers', async () => {
+    const models = await plugin.provider.models({}, { auth: authFor() });
+    assert.deepEqual(Object.keys(models), [model, 'gemini-3.5-flash-lite']);
+    assert.deepEqual(models[model].api, { id: model, url: baseURL, npm: '@ai-sdk/google' });
+    assert.deepEqual(models[model].also, ['@ai-sdk/openai-compatible']);
+    assert.deepEqual(Object.keys(models[model].variants), ['low', 'medium', 'high']);
+    const loader = await plugin.auth.loader(async () => authFor());
+    const res = await post(loader, `${baseURL}/chat/completions`, {
+      model, reasoning_effort: 'medium', messages: [{ role: 'user', content: 'ping' }]
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { choices: [{ message: { content: 'chat' } }], usage: { total_tokens: 5 } });
+    assert.equal(JSON.parse(seen.at(-1).raw).model, medium);
+  });
+
+  it('forwards a full AGY-shaped /v1 SSE request and yields the first native chunk before completion', async () => {
+    const loader = await plugin.auth.loader(async () => authFor('native-test-cold'));
+    const body = {
+      model: `models/${model}`,
+      contents: [
+        { role: 'user', parts: [{ text: 'hold' }, { inlineData: { mimeType: 'image/png', data: 'aW1hZ2U=' } }] },
+        { role: 'model', parts: [{ functionCall: { id: 'call_1', name: 'read', args: { path: '/tmp/test' } }, thoughtSignature: 'YWJj' }] },
+        { role: 'user', parts: [{ functionResponse: { id: 'call_1', name: 'read', response: { result: 'test' } } }] }
+      ],
+      systemInstruction: { parts: [{ text: 'Keep bytes: "\\": }' }] },
+      tools: [{ functionDeclarations: [{ name: 'read', parametersJsonSchema: { type: 'object' } }] }],
+      toolConfig: { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['read'] } },
+      safetySettings: [{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' }],
+      generationConfig: { maxOutputTokens: 100, responseModalities: ['TEXT'], thinkingConfig: { includeThoughts: true } }
+    };
+    const raw = JSON.stringify(body, null, 2).replace('"path":', '"offset": 9007199254740993, "path":');
+    const start = seen.length;
+    const res = await post(loader, `${url()}?alt=sse`, raw, {
+      headers: {
+        accept: 'text/event-stream', authorization: 'Bearer caller', cookie: 'caller=value',
+        'x-goog-api-key': 'caller', 'x-goog-user-project': 'caller', 'x-magpie-effort': 'HIGH'
+      }
+    });
+    try {
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('x-accel-buffering'), 'no');
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let received = '';
+      while (received.length < firstFrame.length) {
+        const chunk = await reader.read();
+        assert.equal(chunk.done, false);
+        received += decoder.decode(chunk.value, { stream: true });
+      }
+      assert.equal(received, firstFrame);
+      assert.deepEqual(seen.slice(start).map(r => r.url), ['/edge/v1/models', `/edge/v1/models/${high}:streamGenerateContent?alt=sse`]);
+      assert.equal(seen.at(-1).raw, raw);
+      const headers = seen.at(-1).headers;
+      assert.equal(headers.authorization, 'Bearer native-test-cold');
+      for (const name of ['cookie', 'x-goog-api-key', 'x-goog-user-project', 'x-magpie-effort']) assert.equal(headers[name], undefined);
+      releaseStream();
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        received += decoder.decode(chunk.value, { stream: true });
+      }
+      assert.equal(received + decoder.decode(), firstFrame + lastFrame);
+    } finally {
+      releaseStream?.();
+    }
+  });
+
+  it('preserves prefixed v1beta, native JSON, countTokens and upstream errors', async () => {
+    const loader = await plugin.auth.loader(async () => authFor());
+    for (const [action, body, expected] of [
+      ['generateContent', text, nativeJSON],
+      ['streamGenerateContent', text, `[${nativeJSON.trim()}]\n`],
+      ['countTokens', { generateContentRequest: { model: `models/${model}`, ...text } }, '{"totalTokens":5}\n']
+    ]) {
+      const res = await post(loader, url(action, model, 'v1beta'), body);
+      assert.equal(res.status, 200);
+      assert.equal(await res.text(), expected);
+      assert.equal(seen.at(-1).url, `/edge/v1beta/models/${model}:${action}`);
+    }
+    assert.deepEqual(JSON.parse(seen.at(-1).raw).contents, text.contents);
+    const res = await post(loader, url('generateContent'), { contents: [{ parts: [{ text: 'upstream error' }] }] });
+    assert.equal(res.status, 400);
+    assert.equal(res.headers.get('retry-after'), '7');
+    assert.equal(res.headers.get('x-magpie-sign-in'), 'kept');
+    assert.equal(await res.text(), errorJSON);
+  });
+
+  it('uses host effort before native level and budget, and scopes twins to the current bearer', async () => {
+    let auth = authFor();
+    const loader = await plugin.auth.loader(async () => auth);
+    for (const [thinkingConfig, header, expected] of [
+      [{ includeThoughts: true }, undefined, model],
+      [{ thinkingBudget: 0, includeThoughts: true }, undefined, model],
+      [{ thinkingBudget: 4096 }, undefined, model],
+      [{ thinkingBudget: 4097 }, undefined, medium],
+      [{ thinkingBudget: 12000 }, undefined, medium],
+      [{ thinkingBudget: 12001 }, undefined, high],
+      [{ thinkingBudget: -1 }, undefined, medium],
+      [{ thinkingLevel: 'MEDIUM', thinkingBudget: 24000 }, undefined, medium],
+      [{ thinkingLevel: 'HIGH' }, 'minimal', model]
+    ]) {
+      const res = await post(loader, url('generateContent'), { ...text, generationConfig: { thinkingConfig } }, {
+        headers: header ? { 'x-magpie-effort': header } : {}
+      });
+      assert.equal(res.status, 200);
+      await res.body.cancel();
+      assert.equal(seen.at(-1).url, `/edge/v1/models/${expected}:generateContent`);
+    }
+    const highEffort = { headers: { 'x-magpie-effort': 'high' } };
+    let res = await post(loader, url('generateContent', medium), text, highEffort);
+    assert.equal(res.status, 200);
+    await res.body.cancel();
+    assert.equal(seen.at(-1).url, `/edge/v1/models/${medium}:generateContent`);
+
+    auth = authFor('native-test-b');
+    res = await post(loader, url('generateContent'), text, highEffort);
+    assert.equal(res.status, 200);
+    await res.body.cancel();
+    assert.equal(seen.at(-1).url, `/edge/v1/models/${model}:generateContent`);
+    assert.equal(seen.at(-1).headers.authorization, 'Bearer native-test-b');
+    assert.equal((await post(loader, url('countTokens', medium))).status, 404);
+    assert.equal((await post(loader, url('countTokens', 'gemini-account-b'))).status, 200);
+
+    auth = { ...authFor(), metadata: { baseURL, mode: 'studio' } };
+    const start = seen.length;
+    assert.equal((await post(loader, url('generateContent'))).status, 401);
+    assert.equal(seen.length, start);
+  });
+
+  it('rejects unsupported routes, tools, media and ambiguous JSON before forwarding', async () => {
+    const restricted = await GeminiWebPlugin({}, { allowTools: false, allowImages: false });
+    const locked = await restricted.auth.loader(async () => authFor('native-test-restricted'));
+    const loader = await plugin.auth.loader(async () => authFor());
+    const parts = (...parts) => ({ contents: [{ parts }] });
+    const image = { inlineData: { mimeType: 'image/png', data: 'aW1hZ2U=' } };
+    const start = seen.length;
+    for (const body of [
+      { ...text, Tools: [{ functionDeclarations: [{ name: 'read' }] }] },
+      { ...text, 'toolſ': [{ functionDeclarations: [{ name: 'read' }] }] },
+      { ...text, toolConfig: { functionCallingConfig: { mode: 'ANY' } } },
+      parts({ FunctionCall: { name: 'read', args: {} } }),
+      parts({ function_response: { name: 'read', response: {} } }),
+      parts(image),
+      { ...text, SystemInstruction: { parts: [image] } },
+      { generateContentRequest: parts(image) }
+    ]) {
+      assert.equal((await post(locked, url('countTokens'), body)).status, 400);
+    }
+    for (const body of [
+      { tools: {} }, { tools: [{ googleSearch: {} }] }, { tools: [{ functionDeclarations: [{}] }] },
+      parts({ functionCall: { name: 'read', args: [] } }),
+      parts({ executableCode: { language: 'PYTHON', code: 'print(1)' } }),
+      parts({ functionResponse: { name: 'read', parts: [image] } }),
+      parts({ inlineData: { mimeType: 'image/png', data: 'not base64' } }),
+      parts({ inlineData: { mimeType: 'video/mp4', data: 'ZGF0YQ==' } }),
+      parts({ fileData: { mimeType: 'image/png', fileUri: `${origin}/admin` } }),
+      { ...text, generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } },
+      { ...text, model: 'models/gemini-somewhere-else' },
+      '{"toolConfig":{"functionCallingConfig":{"mode":"ANY"}},"tool\\u0043onfig":{}}',
+      '{"contents":[],"CONTENTS":[]}'
+    ]) {
+      assert.equal((await post(loader, url('generateContent'), body)).status, 400);
+    }
+    for (const target of [
+      `${url()}?alt=sse&key=caller`, `${url()}?alt=sse&alt=sse`, `${url()}#fragment`,
+      `${url('generateContent')}?alt=sse`, `${url('countTokens')}?alt=sse`,
+      url('unsupported'), url('generateContent', 'gemini-evil%2fadmin'),
+      url('generateContent', 'gemini-3.1-flash-image'), url('generateContent', 'gemini-unknown'),
+      url('generateContent').replace('/edge/', '/other/'), url('generateContent').replace('127.0.0.1', 'localhost')
+    ]) {
+      assert.ok([400, 404].includes((await post(loader, target)).status), target);
+    }
+    assert.equal((await loader.fetch(url('generateContent'))).status, 400);
+    assert.equal(seen.length, start);
+
+    const redirected = await post(loader, url('generateContent'), parts({ text: 'redirect' }));
+    assert.equal(redirected.status, 502);
+    assert.equal(redirected.headers.get(UNREACHABLE_HEADER), null);
+    assert.deepEqual(seen.slice(start).map(r => r.url), [`/edge/v1/models/${model}:generateContent`]);
+  });
+
+  it('propagates caller cancellation and a silent-chunk timeout on native SSE', async () => {
+    const impatient = await GeminiWebPlugin({}, { requestTimeoutMs: 250 });
+    const loader = await impatient.auth.loader(async () => authFor());
+    const body = { contents: [{ parts: [{ text: 'hold' }] }] };
+    const controller = new AbortController();
+    let res = await post(loader, `${url()}?alt=sse`, body, { signal: controller.signal });
+    const reader = res.body.getReader();
+    assert.equal((await reader.read()).done, false);
+    controller.abort();
+    await assert.rejects(reader.read(), { name: 'AbortError' });
+
+    res = await post(loader, `${url()}?alt=sse`, body);
+    const stalled = res.body.getReader();
+    assert.equal((await stalled.read()).done, false);
+    await assert.rejects(stalled.read(), { name: 'TimeoutError' });
+  });
+
+  it('forwards catalog status and headers after the per-account TTL expires', async () => {
+    const keyA = 'native-ttl-a';
+    const keyB = 'native-ttl-b';
+    let auth = authFor(keyA);
+    const loader = await plugin.auth.loader(async () => auth);
+    const target = url('generateContent');
+    for (const key of [keyA, keyB]) await plugin.provider.models({}, { auth: authFor(key) });
+    const reply = (key, status, headers) => catalogReplies.set(`Bearer ${key}`, res => {
+      res.writeHead(status, headers);
+      res.end();
+    });
+    reply(keyA, 429, { 'retry-after': '37', 'x-gemini-web-backend': 'unreachable' });
+    reply(keyB, 401, { 'x-magpie-sign-in': 'kept' });
+    const start = seen.length;
+    const warm = await post(loader, target);
+    assert.equal(warm.status, 200);
+    await warm.text();
+    assert.equal(seen.length, start + 1);
+    const now = Date.now;
+    Date.now = () => now() + 11 * 60 * 1000;
+    try {
+      let res = await post(loader, target);
+      assert.equal(res.status, 429);
+      assert.equal(res.headers.get('retry-after'), '37');
+      assert.equal(res.headers.get('x-magpie-sign-in'), null);
+      assert.equal(res.headers.get(UNREACHABLE_HEADER), null);
+      await assert.rejects(plugin.provider.models({}, { auth }), err =>
+        err.status === 429 && new Headers(err.headers).get('retry-after') === '37');
+
+      auth = authFor(keyB);
+      res = await post(loader, target);
+      assert.equal(res.status, 401);
+      assert.equal(res.headers.get('x-magpie-sign-in'), 'kept');
+      await assert.rejects(plugin.provider.models({}, { auth }), { status: 401, signIn: 'kept' });
+
+      reply(keyB, 401, {});
+      res = await post(loader, target);
+      assert.equal(res.status, 401);
+      assert.equal(res.headers.get('x-magpie-sign-in'), 'expired');
+      assert.deepEqual(seen.slice(start + 1).map(({ url, headers }) => [url, headers.authorization]), [
+        ['/edge/v1/models', `Bearer ${keyA}`], ['/edge/v1/models', `Bearer ${keyA}`],
+        ['/edge/v1/models', `Bearer ${keyB}`], ['/edge/v1/models', `Bearer ${keyB}`],
+        ['/edge/v1/models', `Bearer ${keyB}`]
+      ]);
+    } finally {
+      Date.now = now;
+    }
+  });
+
+  it('returns 504 for catalog silence before headers and after the first body bytes', async () => {
+    const impatient = await GeminiWebPlugin({}, { modelTimeoutMs: 250 });
+    const target = url('generateContent');
+    for (const afterHeaders of [false, true]) {
+      const key = `native-timeout-${afterHeaders}`;
+      const hit = seen.length;
+      catalogReplies.set(`Bearer ${key}`, res => {
+        if (!afterHeaders) return;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"data":[');
+      });
+      const loader = await impatient.auth.loader(async () => authFor(key));
+      const res = await post(loader, target);
+      assert.equal(res.status, 504, `afterHeaders=${afterHeaders}`);
+      assert.equal(res.headers.get(UNREACHABLE_HEADER), null);
+      assert.deepEqual(seen.slice(hit).map(r => r.url), ['/edge/v1/models']);
+    }
+  });
+
+  it('propagates caller abort during catalog discovery without dispatching a generation', async () => {
+    const reason = new Error('cancel catalog lookup');
+    for (const afterHeaders of [false, true]) {
+      const key = `native-catalog-abort-${afterHeaders}`;
+      const controller = new AbortController();
+      const arrived = new Promise(resolve => catalogReplies.set(`Bearer ${key}`, res => {
+        if (afterHeaders) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.write('{"data":[');
+        }
+        resolve();
+      }));
+      const loader = await plugin.auth.loader(async () => authFor(key));
+      const hit = seen.length;
+      const pending = post(loader, url('generateContent'), text, { signal: controller.signal });
+      await Promise.race([arrived, pending.then(() => assert.fail('catalog request never arrived'))]);
+      controller.abort(reason);
+      await assert.rejects(pending, err => err === reason);
+      assert.deepEqual(seen.slice(hit).map(r => r.url), ['/edge/v1/models']);
+    }
+  });
+
+  it('marks only connection failures in the catalog lookup as eligible for managed recovery', async () => {
+    catalogReplies.set('Bearer native-catalog-redirect', res => {
+      res.writeHead(307, { location: '/different-service' });
+      res.end();
+    });
+    const hit = seen.length;
+    const redirectLoader = await plugin.auth.loader(async () => authFor('native-catalog-redirect'));
+    const redirect = await post(redirectLoader, url('generateContent'));
+    assert.equal(redirect.status, 502);
+    assert.equal(redirect.headers.get(UNREACHABLE_HEADER), null);
+    assert.deepEqual(seen.slice(hit).map(r => r.url), ['/edge/v1/models']);
+
+    const closed = http.createServer();
+    await new Promise(resolve => closed.listen(0, '127.0.0.1', resolve));
+    const offlineURL = `http://127.0.0.1:${closed.address().port}/v1`;
+    await new Promise(resolve => closed.close(resolve));
+    const offlineLoader = await plugin.auth.loader(async () => ({
+      ...authFor('native-catalog-offline'), metadata: { baseURL: offlineURL }
+    }));
+    const failure = await post(offlineLoader, `${offlineURL}/models/${model}:generateContent`);
+    assert.equal(failure.status, 502);
+    assert.equal(failure.headers.get(UNREACHABLE_HEADER), 'unreachable');
+  });
+
+  it('rejects snake_case protocol aliases and preserves custom JSON including wrapped counts', async () => {
+    const loader = await plugin.auth.loader(async () => authFor());
+    const target = url('generateContent');
+    const aliasedBodies = [
+      [{ ...text, tools: [{ function_declarations: [{ name: 'read' }] }] }, /functionDeclarations/],
+      [{ contents: [{ parts: [{ text: 'ping' }, { inline_data: { mimeType: 'image/png', data: 'aW1hZ2U=' } }] }] }, /inlineData/],
+      [{ ...text, tool_config: { functionCallingConfig: { mode: 'NONE' } } }, /toolConfig/],
+      [{ ...text, generationConfig: { thinkingConfig: { include_thoughts: true } } }, /includeThoughts/],
+      [{ ...text, tools: [{ functionDeclarations: [], function_declarations: [] }] }, /ambiguous/i]
+    ];
+    const hit = seen.length;
+    for (const [body, message] of aliasedBodies) {
+      const res = await post(loader, target, body, { headers: { 'x-magpie-effort': 'low' } });
+      assert.equal(res.status, 400);
+      assert.match((await res.json()).error.message, message);
+    }
+    assert.equal(seen.length, hit);
+
+    const raw = `{
+      "contents": [{"parts":[{"functionCall":{"name":"read","args":{"file_id":9007199254740993,"fileId":"different"}}}]}],
+      "tools": [{"functionDeclarations":[{"name":"read","parametersJsonSchema":{"properties":{"file_id":{"const":9007199254740995}}}}]}],
+      "custom_field": {"inline_data": [9007199254740997]}
+    }`;
+    const generated = await post(loader, target, raw);
+    assert.equal(generated.status, 200);
+    await generated.text();
+    assert.equal(seen.at(-1).raw, raw);
+    const counted = await post(loader, url('countTokens'), `{"generateContent\\u0052equest": ${raw} }`);
+    assert.equal(counted.status, 200);
+    await counted.text();
+    assert.equal(seen.at(-1).raw, raw);
+  });
+
+  it('allows explicit NONE with tools disabled and rejects declarations, history or other modes', async () => {
+    const restricted = await GeminiWebPlugin({}, { allowTools: false });
+    const loader = await restricted.auth.loader(async () => authFor('native-none'));
+    const target = url('generateContent');
+    const withMode = mode => ({ ...text, toolConfig: { functionCallingConfig: { mode } } });
+    const res = await post(loader, target, { ...withMode('NONE'), tools: [] });
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(JSON.parse(seen.at(-1).raw).toolConfig.functionCallingConfig.mode, 'NONE');
+    const hit = seen.length;
+    for (const body of [
+      withMode('AUTO'), withMode('ANY'), withMode('VALIDATED'), withMode(undefined),
+      { ...withMode('NONE'), tools: [{ functionDeclarations: [{ name: 'read' }] }] },
+      { ...withMode('NONE'), contents: [{ parts: [{ functionCall: { name: 'read', args: {} } }] }] },
+      { ...withMode('NONE'), contents: [{ parts: [{ functionResponse: { name: 'read', response: {} } }] }] }
+    ]) {
+      const blocked = await post(loader, target, body);
+      assert.equal(blocked.status, 400);
+      assert.match((await blocked.json()).error.message, /Tool calls are turned off/);
+    }
+    assert.equal(seen.length, hit);
+  });
+
+  it('ignores an upstream recovery marker without replaying a managed POST', async () => {
+    const previousDir = process.env.GEMINI_WEB_DATA_DIR;
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'magpie-native-recovery-test-'));
+    const key = 'native-recovery-test';
+    const localBaseURL = `${origin}/v1`;
+    const target = `${localBaseURL}/models/${model}:generateContent`;
+    // A responding setup with a binary path takes ensureBackend's early return. No binary runs.
+    const bin = binaryPath(dataDir);
+    fs.mkdirSync(path.dirname(bin));
+    fs.writeFileSync(bin, '');
+    fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify({ host: '127.0.0.1', port: server.address().port }));
+    fs.writeFileSync(path.join(dataDir, 'secrets.json'), JSON.stringify({ apiKey: key, adminToken: 'fixture' }));
+    process.env.GEMINI_WEB_DATA_DIR = dataDir;
+    try {
+      const loader = await plugin.auth.loader(async () => ({ ...authFor(key), metadata: { baseURL: localBaseURL } }));
+      for (const status of [429, 403, 401]) {
+        const hit = seen.length;
+        const body = { contents: [{ parts: [{ text: String(status) }] }] };
+        const res = await post(loader, target, body);
+        assert.equal(res.status, status);
+        assert.equal(res.headers.get('retry-after'), status === 429 ? '37' : null);
+        assert.equal(res.headers.get('x-magpie-sign-in'), status === 401 ? 'kept' : null);
+        assert.equal(await res.text(), errorJSON);
+        const requests = status === 429 ? ['/v1/models', new URL(target).pathname] : [new URL(target).pathname];
+        assert.deepEqual(seen.slice(hit).map(r => r.url), requests);
+        assert.equal(res.headers.get(UNREACHABLE_HEADER), null);
+      }
+
+      const chatURL = `${localBaseURL}/chat/completions`;
+      const chatBody = `{ "model":"${model}", "messages":[], "ext":9007199254740993 }\n`;
+      const cases = [
+        [target, '{ "contents":[{"parts":[{"text":"recover"}]}], "ext":9007199254740993 }\n'],
+        [chatURL, chatBody],
+        [chatURL, chatBody, true]
+      ];
+      for (const [retryTarget, raw, inheritedMethod] of cases) {
+        const hit = seen.length;
+        const upload = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(raw));
+            controller.close();
+          }
+        });
+        const fetch = globalThis.fetch;
+        const attempts = [];
+        // Exercise the plugin's recovery without depending on the runtime's socket-level retries.
+        globalThis.fetch = (url, init) => {
+          if (url === retryTarget) {
+            attempts.push([init.method, init.headers.get('accept'), init.body]);
+            if (attempts.length === 1) return Promise.reject(new TypeError('fixture connection refused'));
+          }
+          return fetch(url, init);
+        };
+        try {
+          const accept = inheritedMethod ? 'application/vnd.retry-fixture+json' : 'application/json';
+          const request = inheritedMethod
+            ? new Request(retryTarget)
+            : new Request(retryTarget, { method: 'POST', body: upload, duplex: 'half' });
+          const init = inheritedMethod
+            ? Object.assign(Object.create({ method: 'POST', headers: { Accept: accept } }), { body: raw })
+            : undefined;
+          const recovered = await loader.fetch(request, init);
+          assert.equal(recovered.status, 200);
+          await recovered.text();
+          assert.equal(request.bodyUsed, !inheritedMethod);
+          assert.deepEqual(attempts, [['POST', accept, raw], ['POST', accept, raw]]);
+          assert.deepEqual(seen.slice(hit).map(r => [r.url, r.raw]), [
+            ['/v1/models', ''], [new URL(retryTarget).pathname, raw]
+          ]);
+        } finally {
+          globalThis.fetch = fetch;
+        }
+      }
+    } finally {
+      process.env.GEMINI_WEB_DATA_DIR = previousDir;
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('cancels an open upload without waiting for its producer', async () => {
+    const loader = await plugin.auth.loader(async () => authFor('native-upload-abort'));
+    const target = url('generateContent');
+    const reason = new Error('cancel open upload');
+    const bounded = async (promise, message) => {
+      let timer;
+      try {
+        return await Promise.race([promise, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), 1000);
+        })]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    const hit = seen.length;
+    for (const requestInput of [false, true]) {
+      const ctl = new AbortController();
+      let source, waiting, cancelled;
+      const waitingForMore = new Promise(resolve => { waiting = resolve; });
+      const producerCancelled = new Promise(resolve => { cancelled = resolve; });
+      const body = new ReadableStream({
+        pull(controller) {
+          if (source) {
+            waiting();
+          } else {
+            source = controller;
+            controller.enqueue(new TextEncoder().encode('{"contents":'));
+          }
+        },
+        cancel() {
+          cancelled();
+          return new Promise(() => {});
+        }
+      }, { highWaterMark: 0 });
+      const init = { method: 'POST', body, duplex: 'half', signal: ctl.signal };
+      const pending = requestInput ? loader.fetch(new Request(target, init)) : loader.fetch(target, init);
+      try {
+        await bounded(waitingForMore, 'request did not start reading the upload');
+        ctl.abort(reason);
+        await bounded(assert.rejects(pending, error => error === reason), 'request waited for the open upload');
+        await bounded(producerCancelled, 'request left the upload producer active');
+        assert.equal(body.locked, false);
+      } finally {
+        source?.error(reason);
+        await pending.catch(() => {});
+      }
+    }
+    assert.equal(seen.length, hit, 'abort should reach neither the catalog nor generation');
+  });
+
+  it('preserves the abort reason before reading, maps an upload error to 400, and keeps streamed JSON bytes', async () => {
+    const loader = await plugin.auth.loader(async () => authFor('native-upload-read'));
+    const target = url('generateContent');
+    const ctl = new AbortController();
+    const reason = new Error('already cancelled');
+    ctl.abort(reason);
+    const hit = seen.length;
+    const unused = new ReadableStream({ pull() { assert.fail('aborted request read its body'); } }, { highWaterMark: 0 });
+    await assert.rejects(loader.fetch(target, { method: 'POST', body: unused, duplex: 'half', signal: ctl.signal }),
+      error => error === reason);
+    const broken = new ReadableStream({ pull(controller) { controller.error(new Error('broken upload')); } });
+    const bad = await loader.fetch(target, { method: 'POST', body: broken, duplex: 'half' });
+    assert.equal(bad.status, 400);
+    assert.equal((await bad.json()).error.message, 'Failed to read request body');
+    assert.equal(seen.length, hit, 'failed reads should reach neither the catalog nor generation');
+
+    const raw = '{ "contents": [{"parts":[{"text":"鹊"}]}], "ext": 9007199254740993 }\n';
+    const bytes = new TextEncoder().encode(raw);
+    const split = raw.indexOf('鹊') + 1;
+    const complete = new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes.subarray(0, split));
+        controller.enqueue(bytes.subarray(split));
+        controller.close();
+      }
+    });
+    const ok = await loader.fetch(target, { method: 'POST', body: complete, duplex: 'half' });
+    assert.equal(ok.status, 200);
+    await ok.text();
+    assert.deepEqual(seen.slice(hit).map(r => r.url), ['/edge/v1/models', new URL(target).pathname]);
+    assert.equal(seen.at(-1).raw, raw);
+  });
+
+  for (const [name, createPlugin] of [
+    ['Gemini Web Chat', () => plugin],
+    ['AI Studio', () => AIStudioPlugin({}, { studio: { baseURL } })]
+  ]) {
+    describe(`${name} Request body compatibility`, () => {
+      const raw = `{ "model": "${model}", "messages": [{"role": "user", "content": "鹊"}], "ext": 9007199254740993 }\n`;
+      const bytes = new TextEncoder().encode(raw);
+      let loader, target;
+      const request = (chunks, signal) => new Request(target, {
+        method: 'POST', duplex: 'half', signal,
+        body: new ReadableStream({
+          start(controller) {
+            for (const chunk of chunks) controller.enqueue(chunk);
+            controller.close();
+          }
+        })
+      });
+
+      before(async () => {
+        const service = await createPlugin();
+        loader = await service.auth.loader(async () => authFor());
+        target = `${baseURL}/chat/completions`;
+      });
+
+      it('forwards Uint8Array chunks from a separate vm realm and rejects non-byte chunks', async () => {
+        const foreignBytes = runInNewContext('new Uint8Array(bytes)', { bytes });
+        assert.equal(foreignBytes instanceof Uint8Array, false);
+        const hit = seen.length;
+        for (const init of [undefined, { headers: { accept: 'application/json' } }]) {
+          const ok = await loader.fetch(request([foreignBytes]), init);
+          assert.equal(ok.status, 200);
+          await ok.text();
+        }
+        const expected = [new URL(target).pathname, raw];
+        assert.deepEqual(seen.slice(hit).map(r => [r.url, r.raw]), [expected, expected]);
+
+        const bad = await loader.fetch(request([raw]));
+        assert.equal(bad.status, 400);
+        assert.equal((await bad.json()).error.message, 'Failed to read request body');
+        assert.equal(seen.length, hit + 2);
+      });
+
+      it('rejects inherited consumed and locked bodies, with or without other init fields', async () => {
+        const hit = seen.length;
+        const partial = request([new TextEncoder().encode('already consumed'), bytes]);
+        const reader = partial.body.getReader();
+        assert.equal((await reader.read()).done, false);
+        reader.releaseLock();
+        assert.equal(partial.bodyUsed, true);
+        const locked = request([bytes]);
+        const lock = locked.body.getReader();
+        try {
+          for (const input of [partial, locked]) {
+            await assert.rejects(loader.fetch(input), { name: 'TypeError' });
+            await assert.rejects(loader.fetch(input, { headers: { accept: 'application/json' } }), { name: 'TypeError' });
+          }
+          assert.equal(seen.length, hit, 'unusable bodies must not reach the backend');
+        } finally {
+          lock.releaseLock();
+        }
+
+        const replaced = await loader.fetch(partial, { body: raw });
+        assert.equal(replaced.status, 200);
+        await replaced.text();
+        assert.deepEqual(seen.slice(hit).map(r => [r.url, r.raw]), [[new URL(target).pathname, raw]]);
+      });
+
+      it('propagates the abort reason for a pre-aborted Request with a locked body', async () => {
+        const controller = new AbortController();
+        const input = request([bytes], controller.signal);
+        const reader = input.body.getReader();
+        const reason = new Error('cancel locked upload');
+        const hit = seen.length;
+        try {
+          controller.abort(reason);
+          await assert.rejects(loader.fetch(input), err => err === reason);
+          assert.equal(seen.length, hit);
+        } finally {
+          reader.releaseLock();
+        }
+      });
+    });
+  }
 });
