@@ -9,7 +9,9 @@ import { installBackend, startBackend, getDataDir } from '../lib/native.mjs';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const source = path.join(root, 'backend-source');
 const build = path.join(root, 'backend-build');
-const pinned = 'c90c9320cbb6c34a087e71c741c0ba79e4513bd3';
+const pinned = 'd3165f2679621319d5a054638cb1689b567d2fb2';
+// Previously built local binaries remain usable after a source pin upgrade.
+const supportedBuildCommits = [pinned, 'c90c9320cbb6c34a087e71c741c0ba79e4513bd3'];
 
 const command = process.argv[2];
 
@@ -41,7 +43,7 @@ async function main() {
       const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
 
       const manifest = {
-        version: '4.30.0-argon.1',
+        version: '4.31.0-argon.1',
         sourceCommit: pinned,
         sha256,
         platform: 'darwin',
@@ -59,8 +61,8 @@ async function main() {
         throw new Error(`Build manifest not found at ${manifestPath}. Run 'npm run backend:build:argon' first.`);
       }
       const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-      if (m.sourceCommit !== pinned) {
-        throw new Error(`Manifest sourceCommit mismatch: expected ${pinned}, got ${m.sourceCommit}`);
+      if (!supportedBuildCommits.includes(m.sourceCommit)) {
+        throw new Error(`Unsupported Argon build source commit: ${m.sourceCommit}`);
       }
       if (m.platform !== 'darwin' || m.arch !== 'arm64') {
         throw new Error(`Platform/arch mismatch in manifest: ${m.platform}/${m.arch}`);
@@ -99,8 +101,8 @@ async function main() {
         throw new Error(`Argon build manifest not found at ${argonBuildPath}. Run 'npm run backend:install:argon' first.`);
       }
       const m = JSON.parse(fs.readFileSync(argonBuildPath, 'utf8'));
-      if (m.sourceCommit !== pinned) {
-        throw new Error(`Manifest sourceCommit mismatch: expected ${pinned}, got ${m.sourceCommit}`);
+      if (!supportedBuildCommits.includes(m.sourceCommit)) {
+        throw new Error(`Unsupported Argon build source commit: ${m.sourceCommit}`);
       }
       if (m.platform !== 'darwin' || m.arch !== 'arm64') {
         throw new Error(`Platform/arch mismatch in manifest: ${m.platform}/${m.arch}`);

@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { backendChannel, binaryPath, ensureBackend, installBackend, installLocalBackend, pinnedBinary,
   PINNED_BINARIES, UPSTREAM_BINARIES } from '../lib/native.mjs';
 
@@ -23,6 +25,36 @@ function pinFixture(t, pins, bytes, target = 'darwin-arm64') {
   t.after(() => { pins[target] = previous; });
 }
 
+it('starts a previously installed Argon build only when its digest matches', {
+  skip: process.platform !== 'darwin' || process.arch !== 'arm64'
+}, t => {
+  const dataDir = fixture(t);
+  const executable = binaryPath(dataDir, 'darwin');
+  const script = fileURLToPath(new URL('../scripts/backend-argon.mjs', import.meta.url));
+  const bytes = Buffer.from('#!/bin/sh\nexit 0\n');
+  fs.writeFileSync(path.join(dataDir, 'argon-build.json'), JSON.stringify({
+    version: '4.30.0-argon.1',
+    sourceCommit: 'c90c9320cbb6c34a087e71c741c0ba79e4513bd3',
+    sha256: hash(bytes),
+    platform: 'darwin',
+    arch: 'arm64'
+  }));
+  const start = () => spawnSync(process.execPath, [script, 'start'], {
+    env: { ...process.env, GEMINI_WEB_DATA_DIR: dataDir },
+    encoding: 'utf8',
+    timeout: 10000
+  });
+
+  fs.writeFileSync(executable, 'wrong binary bytes', { mode: 0o700 });
+  const refused = start();
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /Binary integrity verification failed/);
+
+  fs.writeFileSync(executable, bytes);
+  const accepted = start();
+  assert.equal(accepted.status, 0, accepted.stderr);
+});
+
 it('ships pinned optimized and rollback downloads for all six supported targets', () => {
   const targets = ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-arm64', 'win32-x64'];
   assert.deepEqual(Object.keys(PINNED_BINARIES).sort(), targets);
@@ -30,9 +62,9 @@ it('ships pinned optimized and rollback downloads for all six supported targets'
     const [platform, arch] = key.split('-');
     const optimized = pinnedBinary(platform, arch);
     const upstream = pinnedBinary(platform, arch, 'upstream');
-    assert.match(optimized.url, /^https:\/\/github\.com\/dustinyejun\/magpie-gemini-web\/releases\/download\/backend-v4\.30\.0-magpie\.1\//);
+    assert.match(optimized.url, /^https:\/\/github\.com\/dustinyejun\/magpie-gemini-web\/releases\/download\/backend-v4\.31\.0-magpie\.1\//);
     assert.match(optimized.sha256, /^[a-f0-9]{64}$/);
-    assert.match(upstream.url, /^https:\/\/github\.com\/zexadev\/gemini-web2api-go\/releases\/download\/v4\.30\.0\//);
+    assert.match(upstream.url, /^https:\/\/github\.com\/zexadev\/gemini-web2api-go\/releases\/download\/v4\.31\.0\//);
     assert.notEqual(optimized.sha256, upstream.sha256);
     assert.equal(optimized.url.endsWith('.exe'), platform === 'win32');
   }

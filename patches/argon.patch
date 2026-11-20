@@ -18,6 +18,40 @@ index c6a75e2..db2c8f5 100644
  	golang.org/x/sys v0.48.0 // indirect
  	golang.org/x/text v0.42.0 // indirect
  	modernc.org/libc v1.72.3 // indirect
+diff --git a/internal/app/admin.go b/internal/app/admin.go
+index a6122af..b978c48 100644
+--- a/internal/app/admin.go
++++ b/internal/app/admin.go
+@@ -619,9 +619,10 @@ func handleAdminTest(w http.ResponseWriter, r *http.Request) {
+ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
+ 	switch r.Method {
+ 	case http.MethodGet:
++		current := rtCfg()
+ 		writeJSON(w, 200, map[string]interface{}{
+-			"config": rtCfg(),
+-			"models": modelNamesSorted(),
++			"config": current,
++			"models": modelNamesSorted(current.DefaultModel),
+ 			// 部署期配置只读展示，改这些要动 docker-compose.yml 并重启
+ 			"deploy": map[string]interface{}{
+ 				"host":        cfg.Host,
+@@ -649,9 +650,14 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
+-func modelNamesSorted() []string {
++func modelNamesSorted(currentDefault string) []string {
++	models := availableModels()
++	// 暂无账号时仍保留已配置的默认值，避免保存其他设置时下拉框把它换掉。
++	if model, ok := Models[currentDefault]; ok && model.Retired == "" {
++		models[currentDefault] = model
++	}
+ 	var names []string
+-	for n := range availableModels() {
++	for n := range models {
+ 		names = append(names, n)
+ 	}
+ 	sort.Strings(names)
 diff --git a/internal/app/admin_cookies.go b/internal/app/admin_cookies.go
 index 78236c6..58e5ce3 100644
 --- a/internal/app/admin_cookies.go
@@ -82,15 +116,15 @@ index 78236c6..58e5ce3 100644
  			// 只改传了的字段：没传的沿用当前值。
  			var curLabel, curNote string
 diff --git a/internal/app/admin_ui/index.html b/internal/app/admin_ui/index.html
-index 883532e..19a6ca8 100644
+index b17887d..a16255b 100644
 --- a/internal/app/admin_ui/index.html
 +++ b/internal/app/admin_ui/index.html
 @@ -1020,7 +1020,8 @@ const RT_GROUPS = [
        { k: 'retry_attempts', label: '重试次数', type: 'int', min: 1, max: 10,
          hint: '含首次；流式已吐字后不再重试' },
        { k: 'retry_delay_sec', label: '重试间隔（秒）', type: 'int', min: 0, max: 60 },
--      { k: 'request_timeout_sec', label: '上游超时（秒）', type: 'int', min: 5, max: 600 },
-+      { k: 'request_timeout_sec', label: '上游超时（秒）', type: 'int', min: 5, max: 600,
+-      { k: 'request_timeout_sec', label: '上游超时（秒）', type: 'int', min: 5, max: 1200 },
++      { k: 'request_timeout_sec', label: '上游超时（秒）', type: 'int', min: 5, max: 1200,
 +        hint: '对话请求按上游沉默计时：这么久一个字节都没来才放弃这一次（没出字前会重试）。排队时上游每 60 秒发一次心跳，回复一直在出也不会截断。其它请求（取页面、上传等）仍是整次请求的上限' },
        { k: 'retry_on_timeout', label: '超时后重试', type: 'bool',
          hint: '开：上游等满「上游超时」还没回完时，按重试次数再发（默认）。关：超时直接报错——等满一次都没回完，重发多半还是超时，一个请求最坏要等「超时 × 重试次数」，超长输入或慢模型（如 Argon）下能拖十几分钟。其他失败（空响应、出错话术等）照常重试' },
@@ -1974,7 +2008,7 @@ index e60c6b1..7a94556 100644
  	if extractSAPISID(a.Cookie) == "" {
  		detail += "，但缺 SAPISID（算不出授权头，部分接口会被当匿名）"
 diff --git a/internal/app/gemini.go b/internal/app/gemini.go
-index cae00e7..4643144 100644
+index e6b6738..b207679 100644
 --- a/internal/app/gemini.go
 +++ b/internal/app/gemini.go
 @@ -15,6 +15,7 @@ import (
@@ -1985,7 +2019,7 @@ index cae00e7..4643144 100644
  	"time"
  
  	fhttp "github.com/bogdanfinn/fhttp"
-@@ -170,6 +171,10 @@ var Models = map[string]ModelConfig{
+@@ -178,6 +179,10 @@ var Models = map[string]ModelConfig{
  	// 中档：think 线值 4（高档是 2）。中档思考在服务端内部完成、不吐思考链，所以不设
  	// Thinking（不期望 reasoning_content），登录门控靠 hexArgon4 + thinkWire。
  	"gemini-4-argon-thinking-medium": {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Argon", UpstreamAliases: []string{"4 Carbon"}, Desc: "4 Argon at the Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
@@ -1996,14 +2030,19 @@ index cae00e7..4643144 100644
  
  	// 媒体生成。inner[49] 一填，服务端换后端模型出图/出乐；产物走 hNvQHb + 下载 host
  	// 取回，以 base64 data URL 塞进 content 返回。都要登录态，没 cookie 时不暴露。
-@@ -245,10 +250,18 @@ func availableModels() map[string]ModelConfig {
- // 那是误读：抓包显示 inner[17] 是会话内的轮次索引（首轮 [[0]]，带会话 id 的
- // 第二轮 [[1]]，逐轮递增），跟思考深度无关。我们每次都开新会话，该值恒为 0。
- // 后缀不报错只忽略，避免打断已经配了这个写法的客户端。
+@@ -244,16 +249,17 @@ func availableModels() map[string]ModelConfig {
+ 	return out
+ }
+ 
+-// resolveModel maps a model name to its config.
+-//
+-// "name@think=N" 后缀会被剥掉并忽略。旧版本把它写进 inner[17] 当思考深度，
+-// 那是误读：抓包显示 inner[17] 是会话内的轮次索引（首轮 [[0]]，带会话 id 的
+-// 第二轮 [[1]]，逐轮递增），跟思考深度无关。我们每次都开新会话，该值恒为 0。
+-// 后缀不报错只忽略，避免打断已经配了这个写法的客户端。
 -func resolveModel(modelName string) (string, ModelConfig, error) {
 +// modelNameWithoutThinkSuffix 剥掉旧客户端的 "@think=N" 后缀。inner[17] 是轮次索引，
-+// 不是思考深度；后缀只为兼容已经写进配置的名字。迁移默认模型和 resolveModel 必须共用它，
-+// 否则 "gemini-3.1-pro@think=2" 在迁移时查不到、解析时才报下线。
++// 跟思考深度无关。解析请求和检查默认模型是否已下线时都忽略这个后缀。
 +func modelNameWithoutThinkSuffix(modelName string) string {
  	if idx := strings.Index(modelName, "@think="); idx >= 0 {
 -		modelName = modelName[:idx]
@@ -2017,7 +2056,7 @@ index cae00e7..4643144 100644
  	mc, ok := availableModels()[modelName]
  	if !ok {
  		if full, exists := Models[modelName]; exists && full.Retired != "" {
-@@ -406,7 +419,7 @@ func (e *pinnedAccountError) Unwrap() error { return e.Err }
+@@ -411,7 +417,7 @@ func (e *pinnedAccountError) Unwrap() error { return e.Err }
  // 自己做。一旦已经吐过内容就不再重试——重试会让客户端收到重复文本。
  func streamGenerate(prompt, latest string, mc ModelConfig,
  	onDelta, onReasoning func(string)) (*StreamResult, error) {
@@ -2026,7 +2065,7 @@ index cae00e7..4643144 100644
  }
  
  // fileRef 是一个已上传附件的引用。
-@@ -421,15 +434,23 @@ type fileRef struct {
+@@ -426,15 +432,23 @@ type fileRef struct {
  //
  // 附件填 inner[0][3]，形状 [[[ref, 1], "文件名"], …]。附件只在登录态可用：
  // 匿名能把文件传上去，但对话里一引用就被服务端回 1100。
@@ -2053,7 +2092,7 @@ index cae00e7..4643144 100644
  		var exhausted *ModelDowngradedError
  		if try > 0 && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
  			// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间
-@@ -447,8 +468,58 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
+@@ -452,8 +466,58 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
  	return res, err
  }
  
@@ -2114,7 +2153,7 @@ index cae00e7..4643144 100644
  	var files []fileRef
  
  	// 先挑号，再按它上次绑的出口挑代理 —— 同一个账号要尽量固定从同一个 IP 出去，
-@@ -458,6 +529,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -463,6 +527,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  	// 不发请求，真正发请求的是下面的 getXSRF，它在拿到 slot 之后。
  	// #20 匿名优先：不需要登录态能力时不占用 cookie 账号，走匿名省额度（见 anonFirstEligible）。
  	// 带附件（图/视频）时不能走匿名——下面 uploadBytes 那段会因 cookieStr=="" 直接报错。
@@ -2124,7 +2163,7 @@ index cae00e7..4643144 100644
  	var acct *CookieAccount
  	skip := exclude
  	if mc.PinAccountID > 0 {
-@@ -515,10 +589,13 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -520,10 +587,13 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
  	rotatedOnce := map[int64]bool{}
  	for acct != nil && len(tried) < maxCookieTries {
@@ -2139,7 +2178,7 @@ index cae00e7..4643144 100644
  		if err == nil {
  			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
  			authUser = acct.AuthUser
-@@ -533,6 +610,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -538,6 +608,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  			}
  			break
  		}
@@ -2150,7 +2189,7 @@ index cae00e7..4643144 100644
  		// 取不到 SNlM0e 基本等于这个 cookie 已失效（页面把我们当匿名用户了）。
  		// 换号之前先给它一次机会：强制轮转一次再重取。
  		//
-@@ -541,9 +622,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -546,9 +620,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  		// 只试一次，且只在这一轮。
  		if !rotatedOnce[acct.ID] {
  			rotatedOnce[acct.ID] = true
@@ -2162,7 +2201,7 @@ index cae00e7..4643144 100644
  						logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
  						acct = fresh
  						cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
-@@ -556,6 +637,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -561,6 +635,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  				}
  			}
  		}
@@ -2172,7 +2211,7 @@ index cae00e7..4643144 100644
  		// 救不回来：是 cookie 的错就记一次失败，让面板上看得出是哪个号该换了；
  		// 断网、出口被拦不记（见 xsrfErrBlamesCookie）。然后换下一个。
  		if xsrfErrBlamesCookie(err) {
-@@ -611,7 +695,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -616,7 +693,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  		}
  		nImg, nVid := 0, 0
  		for _, u := range pending {
@@ -2184,7 +2223,7 @@ index cae00e7..4643144 100644
  			if uerr != nil {
  				return attrib(fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr))
  			}
-@@ -628,7 +715,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -633,7 +713,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
  	// 而且必须走跟正式请求同一个出口。
  	budget := rtCfg().MaxPromptBytes
@@ -2196,7 +2235,7 @@ index cae00e7..4643144 100644
  		return attrib(ferr)
  	} else if used {
  		prompt = p
-@@ -667,11 +757,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -672,11 +755,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  	}
  	inner[1] = []interface{}{"en"}
  	inner[2] = []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
@@ -2209,7 +2248,7 @@ index cae00e7..4643144 100644
  	inner[17] = []interface{}{[]interface{}{0}}
  	if mc.Cont != nil {
  		// Continue an existing conversation: [cid, rid, rcid, null×6, tok26] + turn index
-@@ -679,61 +765,13 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -684,61 +763,13 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  		inner[2] = []interface{}{mc.Cont.CID, mc.Cont.RID, mc.Cont.RCID, nil, nil, nil, nil, nil, nil, ""}
  		inner[17] = []interface{}{[]interface{}{mc.Cont.Turn}}
  	}
@@ -2273,7 +2312,7 @@ index cae00e7..4643144 100644
  
  	innerJSON, err := json.Marshal(inner)
  	if err != nil {
-@@ -773,49 +811,27 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -778,49 +809,27 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  	xsrfRetried := false // XSRF 自愈只做一次，避免死循环
  	t0 := time.Now()
  
@@ -2335,7 +2374,7 @@ index cae00e7..4643144 100644
  		var statusCode int
  		var raw []byte
  		var ttfb int64
-@@ -823,9 +839,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -828,9 +837,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  		var err error
  		if useWC {
  			wcReq.Cookie = cookieStr
@@ -2347,7 +2386,7 @@ index cae00e7..4643144 100644
  		}
  		if len(setCookie) > 0 && cookieID > 0 {
  			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
-@@ -833,6 +849,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -838,6 +847,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  				updateAccountCookie(cookieID, merged)
  			}
  		}
@@ -2358,7 +2397,7 @@ index cae00e7..4643144 100644
  		// 降级不是出口或 cookie 的错，也不该重试：同一个号再发一次还是降级。
  		var mde *ModelDowngradedError
  		if errors.As(err, &mde) {
-@@ -844,10 +864,15 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -849,10 +862,15 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  			return res, err
  		}
  		if err != nil {
@@ -2375,7 +2414,7 @@ index cae00e7..4643144 100644
  				recordProxyResult(picked.ID, false, err.Error())
  			}
  			// 已经往客户端吐过内容就不能重试，否则会重复（思考链也算吐过）。
-@@ -860,7 +885,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -865,7 +883,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  			}
  			if attempt < rtCfg().RetryAttempts-1 {
  				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
@@ -2386,7 +2425,7 @@ index cae00e7..4643144 100644
  			}
  			continue
  		}
-@@ -870,7 +897,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -875,7 +895,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  			if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
  				xsrfRetried = true
  				invalidateXSRF(cookieStr)
@@ -2395,7 +2434,7 @@ index cae00e7..4643144 100644
  					body = buildBody(tok)
  					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
  					setAuthUserHeaders(geminiHeaders, authUser)
-@@ -878,6 +905,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -883,6 +903,10 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  					geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
  					attempt--
  					continue
@@ -2406,7 +2445,7 @@ index cae00e7..4643144 100644
  				}
  			}
  			lastErr = fmt.Errorf("upstream HTTP %d: %s", statusCode, truncate(string(raw), 200))
-@@ -889,7 +920,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -894,7 +918,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  				break
  			}
  			if attempt < rtCfg().RetryAttempts-1 {
@@ -2417,7 +2456,7 @@ index cae00e7..4643144 100644
  			}
  			continue
  		}
-@@ -917,7 +950,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -922,7 +948,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  			}
  			if attempt < rtCfg().RetryAttempts-1 {
  				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
@@ -2428,7 +2467,7 @@ index cae00e7..4643144 100644
  			}
  			continue
  		}
-@@ -929,7 +964,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -934,7 +962,9 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  			}
  			if attempt < rtCfg().RetryAttempts-1 {
  				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, lastErr)
@@ -2439,7 +2478,7 @@ index cae00e7..4643144 100644
  			}
  			continue
  		}
-@@ -995,6 +1032,82 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
+@@ -1000,6 +1030,82 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
  	return attrib(lastErr)
  }
  
@@ -2522,7 +2561,7 @@ index cae00e7..4643144 100644
  // upstreamModelRe 匹配响应帧里服务端自报的模型显示名（帧的 [42] 位）。
  // 形如 ...,"fbb127bbb056c959",null,null,"3.6 Flash",true,...
  var upstreamModelRe = regexp.MustCompile(`\\"[0-9a-f]{16}\\",null,null,\\"([^"\\]{1,40})\\"`)
-@@ -1075,11 +1188,129 @@ func setAuthUserHeaders(h map[string]string, authuser int) {
+@@ -1080,11 +1186,129 @@ func setAuthUserHeaders(h map[string]string, authuser int) {
  // 实测号活一两小时就失效 —— 所以这些必须收下来并写回账号。
  func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL string,
  	onLine func(string) error) (int, []byte, int64, []string, error) {
@@ -2653,7 +2692,7 @@ index cae00e7..4643144 100644
  		if err != nil {
  			return 0, nil, 0, nil, err
  		}
-@@ -1087,36 +1318,37 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL
+@@ -1092,36 +1316,37 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL
  		for k, v := range headers {
  			req.Header.Set(k, v)
  		}
@@ -2700,7 +2739,7 @@ index cae00e7..4643144 100644
  	}
  	return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), nil
  }
-@@ -1233,6 +1465,106 @@ func readBodyWithIdle(body io.ReadCloser, onLine func(string) error, start time.
+@@ -1238,6 +1463,106 @@ func readBodyWithIdle(body io.ReadCloser, onLine func(string) error, start time.
  	return raw, ttfb, err
  }
  
@@ -2807,7 +2846,7 @@ index cae00e7..4643144 100644
  // reasoningInLine 从单个 wrb.fr 行里取出思考链。
  //
  // 位置是 inner[4][0][37][0][0]，比正文（inner[4][0][1][0]）深两层。
-@@ -1538,7 +1870,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
+@@ -1543,7 +1868,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
  	// probe 是旁路探测，不回写 cookie 健康度：它的失败原因跟 cookie 无关。
  	// 但 at 必须带——否则挂了 cookie 之后连通性探测会一直报 400，假报故障。
  	cookieStr, sapisid := loadCookie()
@@ -2816,7 +2855,7 @@ index cae00e7..4643144 100644
  		form.Set("at", tok)
  		body = form.Encode()
  	}
-@@ -1580,6 +1912,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
+@@ -1585,6 +1910,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
  			res.Diagnostic = "构建请求失败: " + e.Error()
  			return res
  		}
@@ -2901,7 +2940,7 @@ index 613cf7f..b24d891 100644
  		if _, ok := err.(*ModelDowngradedError); ok {
  			status = 429
 diff --git a/internal/app/gemini_test.go b/internal/app/gemini_test.go
-index 61273f1..7762351 100644
+index 56af688..18d1ec2 100644
 --- a/internal/app/gemini_test.go
 +++ b/internal/app/gemini_test.go
 @@ -16,6 +16,9 @@ func TestModelHeader(t *testing.T) {
@@ -2914,16 +2953,36 @@ index 61273f1..7762351 100644
  	}
  	for _, c := range cases {
  		name, mc, err := resolveModel(c.name)
-@@ -52,7 +55,8 @@ func TestModelHeader(t *testing.T) {
+@@ -51,8 +54,8 @@ func TestModelHeader(t *testing.T) {
+ 		}
  	}
  	// 守的是「不许冒出假模型」：thinking 版复用同样的 hex，所以看**去重后的 hex 数**，
- 	// 不是条目数。3.6/3.5-lite/3.1-pro/3.8-flash + 4 Argon（#35）= 5 个；
+-	// 不是条目数。3.6/3.5-lite/3.1-pro/3.8-flash + 4 Argon（#35）+ 4 Neon（#84）= 6 个；
 -	// 4 Hydrogen（#74）复用原 3.8 Flash 的 hex，不增加独立 hex。
-+	// 4 Hydrogen（#74）复用原 3.8 Flash 的 hex，4 Carbon（4.29 改名）复用 4 Argon 的
-+	// hex，都不增加独立 hex。3.1 Pro 虽已下线（Retired），条目仍留在表里给老配置报原因。
++	// 不是条目数。3.6/3.5-lite/3.1-pro/3.8-flash + 4 Argon（#35）+ 4 Neon（#84）= 6 个。
++	// 4 Hydrogen 复用 3.8 Flash 的 hex，4 Carbon 复用 4 Argon 的 hex。
  	hexes := map[string]bool{}
  	for _, m := range Models {
  		hexes[m.HexID] = true
+@@ -340,15 +343,15 @@ func TestPro31IsNeonAlias(t *testing.T) {
+ }
+ 
+ // 默认模型存的是下线模型时换成 fallbackDefaultModel，其余字段不动。
+-func TestReplaceRetiredDefault(t *testing.T) {
++func TestNormalizeRetiredDefault(t *testing.T) {
+ 	withRetiredModel(t, "gemini-test-retired")
+ 	c := RuntimeConfig{DefaultModel: "gemini-test-retired", RetryAttempts: 7}
+-	replaceRetiredDefault(&c)
++	normalizeDefaultModel(&c)
+ 	if c.DefaultModel != fallbackDefaultModel || c.RetryAttempts != 7 {
+ 		t.Errorf("got %+v", c)
+ 	}
+ 	c = RuntimeConfig{DefaultModel: "gemini-4-carbon"}
+-	replaceRetiredDefault(&c)
++	normalizeDefaultModel(&c)
+ 	if c.DefaultModel != "gemini-4-carbon" {
+ 		t.Errorf("没下线的默认模型被改了: %s", c.DefaultModel)
+ 	}
 diff --git a/internal/app/headers_test.go b/internal/app/headers_test.go
 new file mode 100644
 index 0000000..ef9b476
@@ -3633,10 +3692,10 @@ index 1bd5bb4..3d473c4 100644
  // forcedName 非空表示客户端点名了某个函数。
 diff --git a/internal/app/revision_test.go b/internal/app/revision_test.go
 new file mode 100644
-index 0000000..d890087
+index 0000000..c7de25e
 --- /dev/null
 +++ b/internal/app/revision_test.go
-@@ -0,0 +1,1010 @@
+@@ -0,0 +1,1011 @@
 +package app
 +
 +import (
@@ -4573,7 +4632,8 @@ index 0000000..d890087
 +}
 +
 +func TestRetiredThinkSuffixMigratesFileAndKV(t *testing.T) {
-+	if _, _, err := resolveModel("gemini-3.1-pro@think=2"); err == nil || !strings.Contains(err.Error(), "retired") {
++	withRetiredModel(t, "gemini-test-retired")
++	if _, _, err := resolveModel("gemini-test-retired@think=2"); err == nil || !strings.Contains(err.Error(), "retired") {
 +		t.Fatalf("旧后缀应和退役模型同一条解析，got %v", err)
 +	}
 +	if name, _, err := resolveModel("gemini-3.6-flash@think=2"); err != nil || name != "gemini-3.6-flash" {
@@ -4583,7 +4643,7 @@ index 0000000..d890087
 +	dir := t.TempDir()
 +	path := filepath.Join(dir, "config.json")
 +	fileJSON := `{
-+		"default_model": "gemini-3.1-pro@think=2",
++		"default_model": "gemini-test-retired@think=2",
 +		"retry_attempts": 4,
 +		"retry_delay_sec": 3,
 +		"request_timeout_sec": 90,
@@ -4622,7 +4682,7 @@ index 0000000..d890087
 +	}
 +
 +	kvJSON := `{
-+		"default_model": "gemini-3.1-pro@think=2",
++		"default_model": "gemini-test-retired@think=2",
 +		"retry_attempts": 6,
 +		"retry_delay_sec": 1,
 +		"request_timeout_sec": 45,
@@ -4815,21 +4875,122 @@ index d227e0f..3a589e3 100644
  			logf("[rotate] 账号 #%d 保活失败: %v", a.ID, err)
  			continue
 diff --git a/internal/app/runtime.go b/internal/app/runtime.go
-index aa1cba9..4a5fb1d 100644
+index 35be878..03993cf 100644
 --- a/internal/app/runtime.go
 +++ b/internal/app/runtime.go
-@@ -159,7 +159,8 @@ func rtCfg() RuntimeConfig {
+@@ -128,12 +128,12 @@ func initRuntimeConfig() {
+ 		StreamKeepaliveSec:     cfg.StreamKeepaliveSec,
+ 		StreamIdleTimeoutSec:   cfg.StreamIdleTimeoutSec,
+ 	}
+-	replaceRetiredDefault(&base)
++	normalizeDefaultModel(&base)
+ 	if raw := kvGet(runtimeConfigKey); raw != "" {
+ 		saved := base
+ 		if err := json.Unmarshal([]byte(raw), &saved); err == nil {
+ 			// 先换掉已下线的默认模型再校验：不然校验失败会把整份面板配置一起丢掉。
+-			replaceRetiredDefault(&saved)
++			normalizeDefaultModel(&saved)
+ 			if err := validateRuntimeConfig(saved); err == nil {
+ 				base = saved
+ 			} else {
+@@ -153,12 +153,12 @@ func rtCfg() RuntimeConfig {
+ 	return rtVal
+ }
+ 
+-// replaceRetiredDefault 把上游已下线的默认模型换成 fallbackDefaultModel。
+-// 老部署的 config.json 或面板里可能存着 gemini-3.1-pro。
++// normalizeDefaultModel 去掉旧模型名后缀，并把已下线的模型换成 fallbackDefaultModel。
+ //
  // 直接写 stderr 不走 logf：logf 只在 log_requests 开着时打，而这里跑在运行时配置
  // 装好之前，rtCfg() 还是零值，logf 一定不打。
- func replaceRetiredDefault(c *RuntimeConfig) {
--	if m, ok := Models[c.DefaultModel]; ok && m.Retired != "" {
-+	name := modelNameWithoutThinkSuffix(c.DefaultModel)
-+	if m, ok := Models[name]; ok && m.Retired != "" {
+-func replaceRetiredDefault(c *RuntimeConfig) {
++func normalizeDefaultModel(c *RuntimeConfig) {
++	c.DefaultModel = modelNameWithoutThinkSuffix(c.DefaultModel)
+ 	if m, ok := Models[c.DefaultModel]; ok && m.Retired != "" {
  		fmt.Fprintf(os.Stderr, "[config] 默认模型 %s 已下线，改用 %s\n", c.DefaultModel, fallbackDefaultModel)
  		c.DefaultModel = fallbackDefaultModel
+@@ -194,8 +194,13 @@ func validateRuntimeConfig(c RuntimeConfig) error {
+ 			return fmt.Errorf("%s=%d 超出允许范围 [%d, %d]", r.name, r.v, r.min, r.max)
+ 		}
  	}
+-	if _, _, err := resolveModel(c.DefaultModel); err != nil {
+-		return fmt.Errorf("default_model 不可用: %v", err)
++	// 启动时 Cookie 池可能尚未就绪。这里校验配置里的模型名，实际请求仍由 resolveModel 检查登录态。
++	model, ok := Models[c.DefaultModel]
++	if !ok {
++		return fmt.Errorf("default_model 不可用: unknown model: %s", c.DefaultModel)
++	}
++	if model.Retired != "" {
++		return fmt.Errorf("default_model 不可用: %s is retired: %s", c.DefaultModel, model.Retired)
+ 	}
+ 	if c.Impersonate == "" {
+ 		return fmt.Errorf("impersonate 不能为空")
+@@ -208,6 +213,7 @@ func validateRuntimeConfig(c RuntimeConfig) error {
+ 
+ // saveRuntimeConfig 校验并持久化，成功后立刻生效。
+ func saveRuntimeConfig(next RuntimeConfig) error {
++	next.DefaultModel = modelNameWithoutThinkSuffix(next.DefaultModel)
+ 	if err := validateRuntimeConfig(next); err != nil {
+ 		return err
+ 	}
+diff --git a/internal/app/runtime_test.go b/internal/app/runtime_test.go
+index 935b741..79431a7 100644
+--- a/internal/app/runtime_test.go
++++ b/internal/app/runtime_test.go
+@@ -1,6 +1,10 @@
+ package app
+ 
+-import "testing"
++import (
++	"slices"
++	"strings"
++	"testing"
++)
+ 
+ // request_timeout_sec 上限 1200（#83）：长思考 + 长输出的 Carbon 请求能跑过 600 秒，
+ // 总超时不会被持续输出重置。卡住的请求另有 stream_idle_timeout_sec 兜底。
+@@ -21,3 +25,39 @@ func TestRequestTimeoutBounds(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestLegacyNeonDefaultLoadsBeforeCookiePool(t *testing.T) {
++	if hasCookie() {
++		t.Fatal("fixture must start without an enabled account")
++	}
++	oldConfig := cfg
++	oldKV := kvGet(runtimeConfigKey)
++	t.Cleanup(func() {
++		cfg = oldConfig
++		_ = kvSet(runtimeConfigKey, oldKV)
++		initRuntimeConfig()
++	})
++	cfg = defaultConfig()
++	cfg.DBPath = oldConfig.DBPath
++	cfg.DefaultModel = "gemini-3.1-pro@think=2"
++
++	const saved = `{"default_model":"gemini-3.1-pro@think=2","request_timeout_sec":900,"retry_on_timeout":false}`
++	if err := kvSet(runtimeConfigKey, saved); err != nil {
++		t.Fatal(err)
++	}
++	initRuntimeConfig()
++	current := rtCfg()
++	if current.DefaultModel != "gemini-3.1-pro" || current.RequestTimeout != 900 || current.RetryOnTimeout {
++		t.Fatalf("legacy default or other panel settings were lost: %+v", current)
++	}
++	if !slices.Contains(modelNamesSorted(current.DefaultModel), current.DefaultModel) {
++		t.Fatal("the settings menu lost its configured selection")
++	}
++	if _, _, err := resolveModel(current.DefaultModel); err == nil || !strings.Contains(err.Error(), "without a Google account cookie") {
++		t.Fatalf("anonymous requests must still be refused: %v", err)
++	}
++	current.RequestTimeout = 1200
++	if err := saveRuntimeConfig(current); err != nil || rtCfg().DefaultModel != "gemini-3.1-pro" {
++		t.Fatalf("cannot save panel settings before an account is available: %v", err)
++	}
++}
 diff --git a/internal/app/server.go b/internal/app/server.go
-index 3b2b0ec..9c3b4e7 100644
+index 596bb20..a492672 100644
 --- a/internal/app/server.go
 +++ b/internal/app/server.go
 @@ -1,6 +1,7 @@

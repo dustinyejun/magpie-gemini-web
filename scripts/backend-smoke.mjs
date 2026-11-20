@@ -68,26 +68,21 @@ try {
   const modelIds = models.data.map(model => model.id);
   assert.ok(modelIds.length > 0);
   assert.ok(modelIds.every(id => id.startsWith('gemini-')));
-  // Anonymous discovery: the Flash routes stay, retired 3.1 Pro is gone, and the
-  // login-only Hydrogen/Carbon/Argon routes are hidden rather than offered as aliases
-  // that would be silently downgraded.
+  // Login-only models and the legacy aliases for Neon stay hidden in anonymous discovery.
   assert.ok(modelIds.includes('gemini-3.6-flash'));
   assert.ok(modelIds.includes('gemini-3.5-flash-lite'));
-  assert.equal(modelIds.includes('gemini-3.1-pro'), false);
-  assert.equal(modelIds.includes('gemini-3.1-pro-thinking'), false);
-  for (const hidden of ['gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon']) {
-    assert.equal(modelIds.includes(hidden), false, `${hidden} must not be listed without a cookie`);
+  const loginOnlyModels = ['gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon',
+    'gemini-4-neon', 'gemini-4-neon-thinking', 'gemini-3.1-pro', 'gemini-3.1-pro-thinking'];
+  for (const model of loginOnlyModels) {
+    assert.equal(modelIds.includes(model), false, `${model} must not be listed without a cookie`);
   }
   const chat = model => fetch(`${setup.baseURL}/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${setup.apiKey}`, 'content-type': 'application/json' },
     body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] })
   });
-  const retired = await chat('gemini-3.1-pro');
-  assert.equal(retired.status, 400);
-  assert.match((await retired.json()).error.message, /retired/);
-  for (const loginOnly of ['gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-argon']) {
-    const refused = await chat(loginOnly);
+  for (const model of loginOnlyModels) {
+    const refused = await chat(model);
     assert.equal(refused.status, 400);
     assert.match((await refused.json()).error.message, /unavailable without a Google account cookie/);
   }
