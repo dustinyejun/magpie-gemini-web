@@ -6,7 +6,7 @@
 
 让 [Magpie](https://usemagpie.ai/) 通过你的 Google 账号使用 **Google AI Studio** 与 **Gemini 网页版**。插件在本机自动运行 [AIStudio2API](https://github.com/Mag1cFall/AIStudio2API) 与 [gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go)，提供对话、原生工具调用、Nano Banana 图片生成与 Deep Research 等能力。
 
-> **新模型支持说明**：**Google AI Studio (`ai-studio`)** 默认自动跟随官方最新稳定版后端，现已直接支持 **`gemini-4-hydrogen`**（含 `xhigh` 思考档位）、**`gemini-4-carbon`**（需账号具备对应权益，如 Google AI Ultra）与 **`gemini-4-argon`**。**Gemini Web (`gemini-web`)** 自上游 v4.29.0 起正式收录 **`gemini-4-hydrogen`**（登录账号即可，含免费号）与 **`gemini-4-carbon`**（付费/Ultra 号；`gemini-4-argon` 保留为同一路由的兼容别名）。上游已下线 `gemini-3.1-pro`，请求直接返回 400 并建议改用上述模型。登录态 `gemini-4-carbon`/`gemini-4-argon` 的生成挂起已由上游 v4.29.0 修复（代价是扩展思考档暂回普通档，见 [#53](https://github.com/BUKOWSKIREAL/magpie-gemini-web/issues/53)）。
+> **新模型支持说明**：**Google AI Studio (`ai-studio`)** 默认自动跟随官方最新稳定版后端，现已直接支持 **`gemini-4-hydrogen`**（含 `xhigh` 思考档位）、**`gemini-4-carbon`**（需账号具备对应权益，如 Google AI Ultra）与 **`gemini-4-argon`**。**Gemini Web (`gemini-web`)** 的托管后端 `4.30.0-magpie.1` 在登录后提供 **`gemini-4-hydrogen`** 和 **`gemini-4-hydrogen-thinking`**。Thinking 的 High 档需要付费账号，免费账号请求时按普通档回答。**`gemini-4-carbon`** 需要付费/Ultra 账号，`gemini-4-argon` 保留为同一路由的兼容别名。上游已下线 `gemini-3.1-pro`，请求直接返回 400 并建议改用上述模型。登录态 `gemini-4-carbon`/`gemini-4-argon` 的生成挂起已由上游 v4.29.0 修复（代价是扩展思考档暂回普通档，见 [#53](https://github.com/BUKOWSKIREAL/magpie-gemini-web/issues/53)）。
 
 ## 怎么选？
 
