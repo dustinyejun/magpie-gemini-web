@@ -15,6 +15,8 @@ __pycache__/
 *.py[cod]
 .venv/
 *.egg-info/
+/.agents/
+/.claude/
 
 # Notes, captures and probes from researching the Gemini app: kept local only
 docs/research/
